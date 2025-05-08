@@ -1,0 +1,8 @@
+[package]
+name = "mdluploader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = "4.5.37"
+opendal = "0.53.1"
