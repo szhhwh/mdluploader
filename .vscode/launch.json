@@ -13,7 +13,7 @@
                     "test",
                     "--no-run",
                     "--lib",
-                    "--package=mdluploader"
+                    "--package=mdluploader",
                 ],
                 "filter": {
                     "name": "mdluploader",
@@ -31,14 +31,17 @@
                 "args": [
                     "build",
                     "--bin=mdluploader",
-                    "--package=mdluploader"
+                    "--package=mdluploader",
                 ],
                 "filter": {
                     "name": "mdluploader",
                     "kind": "bin"
                 }
             },
-            "args": [],
+            "args": [
+                "upload",
+                "/home/szhhwh/jingji_reference/src/reference"
+            ],
             "cwd": "${workspaceFolder}"
         },
         {
