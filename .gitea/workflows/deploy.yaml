@@ -25,6 +25,12 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Package binary
+        run: |
+          mkdir -p release
+          cp target/release/mdluploader release/
+          tar -czvf release/mdluploader.tar.gz -C release mdluploader
+
       - name: Deploy
         uses: saltbo/uptoc@v1.4.3
         with:
