@@ -1,6 +1,7 @@
 pub mod cli;
 
-use std::path::Path;
+use log::debug;
+use std::{fmt::Debug, path::Path};
 use walkdir::WalkDir;
 
 pub struct FileInfo {
@@ -53,12 +54,22 @@ impl std::cmp::PartialEq for FileInfo {
     }
 }
 
-pub fn read_file_list<P: AsRef<Path>>(path: &P, depth: &usize) -> Option<Vec<walkdir::DirEntry>> {
+/// 读取指定路径下的文件列表
+/// # Arguments
+/// - `path` - 要读取的路径
+/// - `depth` - 递归深度
+/// # Return
+/// - `Result<Vec<walkdir::DirEntry>, std::io::Error>` - 返回文件列表或错误
+pub fn read_file_list<P: AsRef<Path> + Debug>(
+    path: &P,
+    depth: &usize,
+) -> Result<Vec<walkdir::DirEntry>, std::io::Error> {
+    // 创建文件列表
     let mut file_list: Vec<walkdir::DirEntry> = Vec::new();
+    // 遍历目录
+    debug!("traversing directory: {:?}", path);
     for item in WalkDir::new(path).max_depth(*depth) {
-        if let Ok(v) = item {
-            file_list.push(v);
-        }
+        file_list.push(item?);
     }
-    Some(file_list)
+    Ok(file_list)
 }

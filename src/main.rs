@@ -51,7 +51,13 @@ async fn main() -> Result<()> {
 }
 
 async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> {
-    let files = read_file_list(&md_src_path, &depth).unwrap();
+    // 读取给定路径下所有文件以及文件夹
+    let files = read_file_list(&md_src_path, &depth)?;
+
+    // 过滤出有效的文件
+    // 1. 只保留文件，排除文件夹
+    // 2. 只保留存在的文件
+    // 3. 只保留扩展名为 .md 的文件
     let vaild_files: Vec<PathBuf> = files
         .par_iter()
         .filter(|x| x.file_type().is_file())
@@ -69,6 +75,7 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
         })
         .collect();
 
+    // 从每个有效的 Markdown 文件中提取本地图片链接
     let image_path_list: Vec<PathBuf> = vaild_files
         .par_iter()
         .filter_map(|current_mdfile_path| extract_image_paths_from_file(current_mdfile_path))
@@ -78,13 +85,14 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
     // 输出所有搜寻到的图像
     info!("{} img links detected in markdown files.", image_path_list.len());
     for item in &image_path_list {
-        debug!("Image detected: {:?}", item);
+        trace!("Image detected: {:?}", item);
     }
+
     // 计算本地图片MD5值
     let local_img_list: Vec<FileInfo> = image_path_list
         .par_iter()
         .map(|img| {
-            // 计算图片 MD5 值
+            // 计算图片MD5值
             trace!("Calculating MD5 for {:?}", img);
             let mut md = md5::Md5::new();
             let mut img_content = vec![];
@@ -143,6 +151,7 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
         uploader.delete_files(deletelist).await?;
     }
 
+    // 处理需要替换的文件
     if !replacelist.is_empty() {
         info!("开始替换文件...");
         uploader.upload_files(replacelist).await?;
