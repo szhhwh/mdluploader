@@ -19,14 +19,6 @@ pub fn diff(
     remote_sorted.sort_unstable();
 
     trace!("Finished sorting local and remote files");
-    trace!(
-        "Local files: {:?}",
-        local_sorted.iter().map(|f| f.get_path()).collect::<Vec<_>>()
-    );
-    trace!(
-        "Remote files: {:?}",
-        remote_sorted.iter().map(|f| f.get_path()).collect::<Vec<_>>()
-    );
 
     // 索引
     let mut local_idx = 0;

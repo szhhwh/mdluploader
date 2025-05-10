@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+use log::trace;
+use url::Url;
+
 #[derive(PartialEq, Debug)]
 enum State {
     Normal,
@@ -8,6 +11,136 @@ enum State {
     ClosingSquareBracketFound,
     OpenParenthesisFound,
     CollectingUrl,
+}
+
+/// 替换 Markdown 内容中的图片链接
+/// # Arguments
+/// - `content` - Markdown 文件内容
+/// - `path_map` - 本地图片路径到 S3 URL 的映射
+/// # Return
+/// - 替换图片链接后的 Markdown 内容
+pub fn link_replacer(content: &str, path_map: &std::collections::HashMap<String, Url>) -> String {
+    let mut result = String::new();
+    let mut state = State::Normal;
+    let mut alt_text = String::new();
+    let mut current_url = String::new();
+    let mut current_pos = 0;
+    let mut is_code_block = false;
+    let mut code_fence_count = 0;
+
+    let chars: Vec<char> = content.chars().collect();
+    
+    while current_pos < chars.len() {
+        let ch = chars[current_pos];
+        
+        // 处理代码块
+        if ch == '`' {
+            code_fence_count += 1;
+            if code_fence_count == 3 {
+                is_code_block = !is_code_block;
+                code_fence_count = 0;
+            }
+        } else {
+            code_fence_count = 0;
+        }
+
+        // 如果在代码块内，跳过替换
+        if is_code_block {
+            result.push(ch);
+            current_pos += 1;
+            continue;
+        }
+
+        match state {
+            State::Normal => {
+                if ch == '!' {
+                    state = State::ExclamationFound;
+                    result.push(ch);
+                } else {
+                    result.push(ch);
+                }
+                current_pos += 1;
+            }
+            State::ExclamationFound => {
+                if ch == '[' {
+                    state = State::OpenSquareBracketFound;
+                    result.push(ch);
+                } else {
+                    state = State::Normal;
+                    result.push(ch);
+                }
+                current_pos += 1;
+            }
+            State::OpenSquareBracketFound => {
+                if ch == ']' {
+                    state = State::ClosingSquareBracketFound;
+                    result.push(ch);
+                } else {
+                    alt_text.push(ch);
+                    result.push(ch);
+                }
+                current_pos += 1;
+            }
+            State::ClosingSquareBracketFound => {
+                if ch == '(' {
+                    state = State::OpenParenthesisFound;
+                    result.push(ch);
+                } else {
+                    state = State::Normal;
+                    result.push(ch);
+                }
+                current_pos += 1;
+            }
+            State::OpenParenthesisFound => {
+                if ch == ')' {
+                    // 空URL的情况
+                    state = State::Normal;
+                    result.push(ch);
+                    current_pos += 1;
+                } else {
+                    current_url.push(ch);
+                    state = State::CollectingUrl;
+                    current_pos += 1;
+                }
+            }
+            State::CollectingUrl => {
+                if ch == ')' {
+                    // URL收集完成，检查是否需要替换
+                    let local_path = PathBuf::from(&current_url).file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    
+                    // 尝试解析绝对路径
+                    if let Some(s3_url) = path_map.get(&local_path) {
+                        // 替换为S3 URL
+                        trace!("替换图片链接: {} -> {}", current_url, s3_url);
+                        result.push_str(s3_url.as_str());
+                    } else {
+                        // 如果没有匹配项，保持原有URL
+                        trace!("未找到替换项，保持原有链接: {}", current_url);
+                        result.push_str(&current_url);
+                    }
+                    
+                    result.push(ch); // 添加闭括号
+                    current_url.clear();
+                    alt_text.clear();
+                    state = State::Normal;
+                } else {
+                    current_url.push(ch);
+                }
+                current_pos += 1;
+            }
+        }
+    }
+    
+    // 处理结束时的状态
+    if state == State::CollectingUrl && !current_url.is_empty() {
+        // 如果结束时正在收集URL，添加已收集的部分
+        result.push_str(&current_url);
+    }
+    
+    result
 }
 
 pub fn extract_img_urls(content: &str) -> Option<Vec<PathBuf>> {

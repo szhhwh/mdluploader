@@ -1,7 +1,7 @@
 pub mod cli;
 
 use anyhow::{Ok, Result};
-use log::{debug, trace};
+use log::debug;
 use md5::Digest;
 use std::{fmt::Debug, path::Path};
 use walkdir::WalkDir;
@@ -82,6 +82,5 @@ pub fn get_file_md5<P: AsRef<Path>>(img: &P) -> Result<String> {
     let _ = std::io::Read::read_to_end(&mut std::fs::File::open(img)?, &mut img_content);
     md.update(&img_content);
     let md = md.finalize();
-    trace!("MD5: {:x}", md);
     Ok(format!("{:x}", md))
 }

@@ -1,12 +1,15 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use differ::diff;
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use mdluploader::{cli::Args, *};
 use opendal::Operator;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::str::FromStr;
 use uploader::{s3::AwsS3, uploader::Uploader};
+use url::Url;
 
 // Modules
 mod differ;
@@ -30,30 +33,40 @@ async fn main() -> Result<()> {
             sk,
             region,
             endpoint,
+            domain,
             remote_root,
         } => {
+            let remote_root = remote_root.unwrap_or("/".to_string());
             let op = AwsS3::new(
                 bucket,
                 ak,
                 sk,
                 region,
-                endpoint,
-                remote_root.unwrap_or("/".to_string()),
+                endpoint.clone(),
+                remote_root.clone(),
             )
             .build()?;
-            upload(path, depth, op).await?;
+            upload(path, depth, op, domain, remote_root).await?;
         }
     }
 
     Ok(())
 }
 
-async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> {
+async fn upload(
+    md_src_path: PathBuf,
+    depth: usize,
+    op: Operator,
+    domain: String,
+    remote_root: String,
+) -> Result<()> {
+    let domain = Url::parse(&domain).with_context(|| format!("Invalid domain URL: {}", domain))?;
+    info!("Get vaild domain: {}", domain);
+
     info!("Starting to upload files...");
     debug!("Source path: {:?}", md_src_path);
     // 读取给定路径下所有文件以及文件夹
     let files = read_file_list(&md_src_path, &depth)?;
-
     // 过滤出有效的文件
     // 1. 只保留文件，排除文件夹
     // 2. 只保留存在的文件
@@ -64,7 +77,7 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
         .filter_map(|x| {
             let p = PathBuf::from(x.path());
             if p.try_exists().unwrap_or(false) {
-                if p.extension().unwrap() == "md" {
+                if p.extension().unwrap_or_default() == "md" {
                     trace!("Valid file detected: {:?}", p);
                     Some(p)
                 } else {
@@ -95,13 +108,11 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
     // 计算本地图片MD5值
     let local_img_list: Vec<FileInfo> = image_path_list
         .par_iter()
-        .filter_map(|img| {
-            match get_file_md5(img) {
-                Ok(md5) => Some(FileInfo::new(img.clone(), md5)),
-                Err(e) => {
-                    log::error!("Failed to get MD5 for {:?}: {}", img, e);
-                    None
-                }
+        .filter_map(|img| match get_file_md5(img) {
+            Ok(md5) => Some(FileInfo::new(img.clone(), md5)),
+            Err(e) => {
+                log::error!("Failed to get MD5 for {:?}: {}", img, e);
+                None
             }
         })
         .collect();
@@ -156,6 +167,87 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
     if !replacelist.is_empty() {
         info!("开始替换文件...");
         uploader.upload_files(replacelist).await?;
+    }
+
+    // 处理 Markdown 文件中的链接替换
+    if !image_path_list.is_empty() {
+        info!("开始替换 Markdown 文件中的图片链接...");
+
+        // 创建一个映射表，将本地图片路径映射到 S3 URL
+        let mut path_map: HashMap<String, Url> = HashMap::new();
+        let mut affected_md_files: HashSet<PathBuf> = HashSet::new();
+
+        // 从云端获取文件列表，用于验证文件是否存在于S3
+        debug!("获取S3云端文件列表以验证文件存在...");
+        let cloud_files = match Uploader::new(op.clone()).list_cloud("/", true).await {
+            Ok(files) => {
+                let file_names: HashSet<String> = files
+                    .par_iter()
+                    .filter_map(|entry| {
+                        let path = entry.path().to_string();
+                        path.split('/').last().map(|s| s.to_string())
+                    })
+                    .collect();
+                file_names
+            }
+            Err(e) => {
+                warn!("获取云端文件列表失败: {}, 将跳过链接替换", e);
+                HashSet::new()
+            }
+        };
+
+        // 遍历所有已上传和替换的图片，构建映射表
+        for img_path in &image_path_list {
+            // 获取文件名
+            if let Some(filename) = img_path.file_name() {
+                let file_name_str = filename.to_string_lossy().to_string();
+
+                // 检查文件是否存在于S3
+                if cloud_files.contains(&file_name_str) {
+                    // 构建 S3 URL，使用自定义域名
+                    let s3_url = Url::from_str(&format!(
+                        "{}/{}",
+                        domain.join(&remote_root)?.to_string(),
+                        file_name_str
+                    ))?;
+                    debug!("构建的 S3 URL: {}", s3_url);
+                    path_map.insert(file_name_str, s3_url);
+
+                    // 遍历所有 Markdown 文件，找出包含此图片的文件
+                    for md_file in &vaild_files {
+                        if let Some(img_paths) = extract_image_paths_from_file(md_file) {
+                            if img_paths.contains(img_path) {
+                                affected_md_files.insert(md_file.clone());
+                            }
+                        }
+                    }
+                } else {
+                    debug!("S3中不存在文件: {}, 跳过链接替换", file_name_str);
+                }
+            }
+        }
+
+        // 遍历受影响的 Markdown 文件，替换链接
+        for md_file in affected_md_files {
+            info!("Replacing links in file: {:?}", md_file);
+
+            // 读取 Markdown 文件内容
+            if let Ok(content) = std::fs::read_to_string(&md_file) {
+                // 执行链接替换
+                let new_content = mdparser::mdparser::link_replacer(&content, &path_map);
+
+                // 写回文件
+                if let Err(e) = std::fs::write(&md_file, new_content) {
+                    warn!("Failed to write back to file {:?}: {}", md_file, e);
+                } else {
+                    info!("Successfully updated links in {:?}", md_file);
+                }
+            } else {
+                warn!("Failed to read file for link replacement: {:?}", md_file);
+            }
+        }
+
+        info!("完成 Markdown 图片链接替换.");
     }
 
     Ok(())

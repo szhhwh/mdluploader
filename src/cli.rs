@@ -37,13 +37,16 @@ pub enum Commands {
         #[arg(long, short)]
         endpoint: String,
 
+        /// Domain for accessing the S3 bucket (used for link replacement)
+        #[arg(long, short = 'd')]
+        domain: String,
+
         /// Remote root path to upload
         #[arg(long, short = 'r')]
         remote_root: Option<String>,
 
         /// Set the maximum depth of the directory tree to traverse
-        /// Default is 10
-        #[arg(short, long, default_value_t = 10)]
+        #[arg(long, default_value_t = 10)]
         depth: usize,
     },
 }
