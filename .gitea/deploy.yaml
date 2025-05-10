@@ -1,0 +1,32 @@
+name: build
+run-name: Release build — ${{ gitea.run_id }}
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened,synchronize]
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build binary
+        run: cargo build --verbose --release
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Deploy
+        uses: saltbo/uptoc@master
+        with:
+          driver: qiniu
+          region: ${{ secrets.QINIU_REGION }}
+          bucket: ${{ secrets.QINIU_BUCKET }}
+          dist: ${{ secrets.QINIU_DIST }}
+          saveroot: ${{ secrets.QINIU_SAVEROOT }}
+        env:
+          UPTOC_UPLOADER_AK: ${{ secrets.QINIU_AK }}
+          UPTOC_UPLOADER_SK: ${{ secrets.QINIU_SK }}
