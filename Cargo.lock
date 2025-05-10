@@ -987,6 +987,7 @@ dependencies = [
  "opendal",
  "rayon",
  "tokio",
+ "url",
  "walkdir",
 ]
 
