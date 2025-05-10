@@ -1,13 +1,13 @@
 use anyhow::Result;
 use clap::Parser;
 use differ::diff;
-use log::{debug, info, Level};
+use log::{debug, info, trace};
 use md5::Digest;
 use mdluploader::{cli::Args, *};
 use opendal::Operator;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{io::Read, path::PathBuf};
-use uploader::{s3::AwsS3, uploader::list_cloud};
+use uploader::{s3::AwsS3, uploader::Uploader};
 
 // Modules
 mod differ;
@@ -31,9 +31,18 @@ async fn main() -> Result<()> {
             sk,
             region,
             endpoint,
+            remote_root,
         } => {
-            // info!("Uploading files...");
-            let op = AwsS3::new(bucket, ak, sk, region, endpoint).build()?;
+            info!("Uploading files...");
+            let op = AwsS3::new(
+                bucket,
+                ak,
+                sk,
+                region,
+                endpoint,
+                remote_root.unwrap_or("/".to_string()),
+            )
+            .build()?;
             upload(path, depth, op).await?;
         }
     }
@@ -67,15 +76,16 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
         .collect();
 
     // 输出所有搜寻到的图像
-    println!("{} files found", image_path_list.len());
+    info!("{} img links detected in markdown files.", image_path_list.len());
     for item in &image_path_list {
-        debug!("{:?}", item);
+        debug!("Image detected: {:?}", item);
     }
     // 计算本地图片MD5值
-    let local_img_list: Vec<(String, String)> = image_path_list
+    let local_img_list: Vec<FileInfo> = image_path_list
         .par_iter()
         .map(|img| {
-            // MD5计算逻辑
+            // 计算图片 MD5 值
+            trace!("Calculating MD5 for {:?}", img);
             let mut md = md5::Md5::new();
             let mut img_content = vec![];
             let _ = std::fs::File::open(img)
@@ -83,42 +93,65 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
                 .read_to_end(&mut img_content);
             md.update(img_content);
             let md = md.finalize();
-            (
-                img.file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                format!("{:x}", md),
-            )
+            FileInfo::new(img.clone(), format!("{:x}", md))
         })
         .collect();
 
     // 从云端拉取文件列表
-    let list = list_cloud(op, "/", true).await?;
-    let remote_img_list: Vec<(String, String)> = list
+    trace!("Starting to list cloud files...");
+    let list = Uploader::new(op.clone()).list_cloud("/", true).await?;
+    let remote_img_list: Vec<FileInfo> = list
         .par_iter()
         .map(|entry| {
-            // 打印云端文件列表
-            info!(
-                "filename: {} md5: {}",
-                entry.name(),
-                entry.metadata().content_md5().unwrap()
-            );
-            (
-                entry.name().to_string(),
+            FileInfo::new(
+                PathBuf::from(entry.path().to_string()),
                 entry.metadata().content_md5().unwrap().to_string(),
             )
         })
         .collect();
+    trace!("Finished list cloud files.");
 
     // 比较云端文件和本地文件，找出需要上传到云端的文件
     let (uploadlist, deletelist, replacelist) = diff::diff(local_img_list, remote_img_list)?;
 
+    // 输出差异列表
+    info!("{} files need to be uploaded.", uploadlist.len());
+    for item in &uploadlist {
+        debug!("File to upload: {:?}", item);
+    }
+    info!("{} files need to be deleted.", deletelist.len());
+    for item in &deletelist {
+        debug!("File to delete: {:?}", item);
+    }
+    info!("{} files need to be replaced.", replacelist.len());
+    for item in &replacelist {
+        debug!("File to replace: {:?}", item);
+    }
+
+    // 创建上传器实例
+    let uploader = Uploader::new(op.clone());
+
+    // 处理需要上传的文件
+    if !uploadlist.is_empty() {
+        info!("开始上传文件...");
+        uploader.upload_files(uploadlist).await?;
+    }
+
+    // 处理需要删除的文件
+    if !deletelist.is_empty() {
+        info!("开始删除文件...");
+        uploader.delete_files(deletelist).await?;
+    }
+
+    if !replacelist.is_empty() {
+        info!("开始替换文件...");
+        uploader.upload_files(replacelist).await?;
+    }
+
     Ok(())
 }
 
-/// 从单个Markdown文件中提取所有有效的图片路径
+/// 从单个 Markdown 文件中提取所有有效的图片路径
 fn extract_image_paths_from_file(current_mdfile_path: &PathBuf) -> Option<Vec<PathBuf>> {
     let buff = match std::fs::read_to_string(current_mdfile_path) {
         Ok(content) => content,
@@ -141,7 +174,7 @@ fn resolve_image_path(img_path: PathBuf, md_file_path: &PathBuf) -> Option<PathB
 
     // 处理相对路径
     let parent_dir = md_file_path.parent()?;
-    let full_path = PathBuf::from(parent_dir).join(img_path);
+    let full_path = PathBuf::from(parent_dir).join(img_path).canonicalize().ok()?;
 
     if full_path.try_exists().unwrap_or(false) {
         Some(full_path)

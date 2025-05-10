@@ -11,6 +11,7 @@ pub struct AwsS3 {
     sk: String,
     region: String,
     ep: String,
+    root: String,
 }
 
 impl AwsS3 {
@@ -20,6 +21,7 @@ impl AwsS3 {
         sk: impl Into<String>,
         region: impl Into<String>,
         ep: impl Into<String>,
+        root: impl Into<String>,
     ) -> AwsS3 {
         AwsS3 {
             bucket: bucket.into(),
@@ -27,15 +29,18 @@ impl AwsS3 {
             sk: sk.into(),
             region: region.into(),
             ep: ep.into(),
+            root: root.into(),
         }
     }
 
     pub fn build(&self) -> Result<Operator> {
         let builder = services::S3::default()
+            .disable_config_load()
             .bucket(&self.bucket)
             .access_key_id(&self.ak)
             .secret_access_key(&self.sk)
             .region(&self.region)
+            .root(&self.root)
             .endpoint(&self.ep);
 
         let op = Operator::new(builder)?

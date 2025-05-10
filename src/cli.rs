@@ -17,20 +17,29 @@ pub enum Commands {
         #[arg(required = true)]
         path: PathBuf,
 
+        /// Path to the folder contains markdown files
         #[arg(short, long)]
         bucket: String,
 
-        #[arg(long)]
+        /// Access key for the cloud storage
+        #[arg(long, short)]
         ak: String,
 
-        #[arg(long)]
+        /// Secret key for the cloud storage
+        #[arg(long, short)]
         sk: String,
 
-        #[arg(long)]
+        /// Region for the cloud storage
+        #[arg(long, short = 'g')]
         region: String,
 
-        #[arg(long)]
+        /// Endpoint for the cloud storage
+        #[arg(long, short)]
         endpoint: String,
+
+        /// Remote root path to upload
+        #[arg(long, short = 'r')]
+        remote_root: Option<String>,
 
         /// Set the maximum depth of the directory tree to traverse
         /// Default is 10
