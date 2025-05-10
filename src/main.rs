@@ -18,7 +18,7 @@ mod uploader;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 初始化日志
+    // Initialize logging
     std::env::set_var("RUST_LOG", "trace");
     env_logger::init();
 
@@ -65,12 +65,12 @@ async fn upload(
 
     info!("Starting to upload files...");
     debug!("Source path: {:?}", md_src_path);
-    // 读取给定路径下所有文件以及文件夹
+    // Read all files and folders from the given path
     let files = read_file_list(&md_src_path, &depth)?;
-    // 过滤出有效的文件
-    // 1. 只保留文件，排除文件夹
-    // 2. 只保留存在的文件
-    // 3. 只保留扩展名为 .md 的文件
+    // Filter valid files
+    // 1. Keep only files, exclude folders
+    // 2. Keep only existing files
+    // 3. Keep only files with .md extension
     let vaild_files: Vec<PathBuf> = files
         .par_iter()
         .filter(|x| x.file_type().is_file())
@@ -89,14 +89,14 @@ async fn upload(
         })
         .collect();
 
-    // 从每个有效的 Markdown 文件中提取本地图片链接
+    // Extract local image links from each valid Markdown file
     let image_path_list: Vec<PathBuf> = vaild_files
         .par_iter()
         .filter_map(|current_mdfile_path| extract_image_paths_from_file(current_mdfile_path))
         .flatten()
         .collect();
 
-    // 输出所有搜寻到的图像
+    // Output all detected images
     info!(
         "{} img links detected in markdown files.",
         image_path_list.len()
@@ -105,7 +105,7 @@ async fn upload(
         trace!("Image detected: {:?}", item);
     }
 
-    // 计算本地图片MD5值
+    // Calculate MD5 values for local images
     let local_img_list: Vec<FileInfo> = image_path_list
         .par_iter()
         .filter_map(|img| match get_file_md5(img) {
@@ -117,7 +117,7 @@ async fn upload(
         })
         .collect();
 
-    // 从云端拉取文件列表
+    // Fetch file list from cloud
     trace!("Starting to list cloud files...");
     let list = Uploader::new(op.clone()).list_cloud("/", true).await?;
     let remote_img_list: Vec<FileInfo> = list
@@ -131,10 +131,10 @@ async fn upload(
         .collect();
     trace!("Finished list cloud files.");
 
-    // 比较云端文件和本地文件，找出需要上传到云端的文件
+    // Compare cloud files and local files to find files that need to be uploaded
     let (uploadlist, deletelist, replacelist) = diff::diff(local_img_list, remote_img_list)?;
 
-    // 输出差异列表
+    // Output difference lists
     info!("{} files need to be uploaded.", uploadlist.len());
     for item in &uploadlist {
         debug!("File to upload: {:?}", item);
@@ -148,37 +148,37 @@ async fn upload(
         debug!("File to replace: {:?}", item);
     }
 
-    // 创建上传器实例
+    // Create uploader instance
     let uploader = Uploader::new(op.clone());
 
-    // 处理需要上传的文件
+    // Process files that need to be uploaded
     if !uploadlist.is_empty() {
-        info!("开始上传文件...");
+        info!("Starting to upload files...");
         uploader.upload_files(uploadlist).await?;
     }
 
-    // 处理需要删除的文件
+    // Process files that need to be deleted
     if !deletelist.is_empty() {
-        info!("开始删除文件...");
+        info!("Starting to delete files...");
         uploader.delete_files(deletelist).await?;
     }
 
-    // 处理需要替换的文件
+    // Process files that need to be replaced
     if !replacelist.is_empty() {
-        info!("开始替换文件...");
+        info!("Starting to replace files...");
         uploader.upload_files(replacelist).await?;
     }
 
-    // 处理 Markdown 文件中的链接替换
+    // Process link replacement in Markdown files
     if !image_path_list.is_empty() {
-        info!("开始替换 Markdown 文件中的图片链接...");
+        info!("Starting to replace image links in Markdown files...");
 
-        // 创建一个映射表，将本地图片路径映射到 S3 URL
+        // Create a mapping table that maps local image paths to S3 URLs
         let mut path_map: HashMap<String, Url> = HashMap::new();
         let mut affected_md_files: HashSet<PathBuf> = HashSet::new();
 
-        // 从云端获取文件列表，用于验证文件是否存在于S3
-        debug!("获取S3云端文件列表以验证文件存在...");
+        // Get file list from cloud to verify file existence in S3
+        debug!("Getting S3 cloud file list to verify file existence...");
         let cloud_files = match Uploader::new(op.clone()).list_cloud("/", true).await {
             Ok(files) => {
                 let file_names: HashSet<String> = files
@@ -191,29 +191,29 @@ async fn upload(
                 file_names
             }
             Err(e) => {
-                warn!("获取云端文件列表失败: {}, 将跳过链接替换", e);
+                warn!("Failed to get cloud file list: {}, skipping link replacement", e);
                 HashSet::new()
             }
         };
 
-        // 遍历所有已上传和替换的图片，构建映射表
+        // Iterate through all uploaded and replaced images to build a mapping table
         for img_path in &image_path_list {
-            // 获取文件名
+            // Get filename
             if let Some(filename) = img_path.file_name() {
                 let file_name_str = filename.to_string_lossy().to_string();
 
-                // 检查文件是否存在于S3
+                // Check if the file exists in S3
                 if cloud_files.contains(&file_name_str) {
-                    // 构建 S3 URL，使用自定义域名
+                    // Build S3 URL using custom domain
                     let s3_url = Url::from_str(&format!(
                         "{}/{}",
                         domain.join(&remote_root)?.to_string(),
                         file_name_str
                     ))?;
-                    debug!("构建的 S3 URL: {}", s3_url);
+                    debug!("Constructed S3 URL: {}", s3_url);
                     path_map.insert(file_name_str, s3_url);
 
-                    // 遍历所有 Markdown 文件，找出包含此图片的文件
+                    // Iterate through all Markdown files to find files containing this image
                     for md_file in &vaild_files {
                         if let Some(img_paths) = extract_image_paths_from_file(md_file) {
                             if img_paths.contains(img_path) {
@@ -222,21 +222,21 @@ async fn upload(
                         }
                     }
                 } else {
-                    debug!("S3中不存在文件: {}, 跳过链接替换", file_name_str);
+                    debug!("File does not exist in S3: {}, skipping link replacement", file_name_str);
                 }
             }
         }
 
-        // 遍历受影响的 Markdown 文件，替换链接
+        // Iterate through affected Markdown files to replace links
         for md_file in affected_md_files {
             info!("Replacing links in file: {:?}", md_file);
 
-            // 读取 Markdown 文件内容
+            // Read Markdown file content
             if let Ok(content) = std::fs::read_to_string(&md_file) {
-                // 执行链接替换
+                // Execute link replacement
                 let new_content = mdparser::mdparser::link_replacer(&content, &path_map);
 
-                // 写回文件
+                // Write back to file
                 if let Err(e) = std::fs::write(&md_file, new_content) {
                     warn!("Failed to write back to file {:?}: {}", md_file, e);
                 } else {
@@ -247,13 +247,13 @@ async fn upload(
             }
         }
 
-        info!("完成 Markdown 图片链接替换.");
+        info!("Completed Markdown image link replacement.");
     }
 
     Ok(())
 }
 
-/// 从单个 Markdown 文件中提取所有有效的图片路径
+/// Extract all valid image paths from a single Markdown file
 fn extract_image_paths_from_file(current_mdfile_path: &PathBuf) -> Option<Vec<PathBuf>> {
     let buff = match std::fs::read_to_string(current_mdfile_path) {
         Ok(content) => content,
@@ -267,14 +267,14 @@ fn extract_image_paths_from_file(current_mdfile_path: &PathBuf) -> Option<Vec<Pa
     })
 }
 
-/// 解析图片路径
+/// Resolve image path
 fn resolve_image_path(img_path: PathBuf, md_file_path: &PathBuf) -> Option<PathBuf> {
-    // 处理绝对路径
+    // Handle absolute path
     if img_path.is_absolute() {
         return Some(img_path);
     }
 
-    // 处理相对路径
+    // Handle relative path
     let parent_dir = md_file_path.parent()?;
     let full_path = PathBuf::from(parent_dir)
         .join(img_path)

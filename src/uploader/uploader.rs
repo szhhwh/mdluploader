@@ -6,50 +6,80 @@ use log::{debug, error, info, trace};
 use opendal::Operator;
 use tokio::{fs::File, task::JoinSet};
 
+/// Represents an uploader that interacts with a cloud storage system.
+/// 
+/// This struct provides methods to upload, list, and delete files in the cloud.
 #[derive(Clone)]
 pub struct Uploader {
+    /// The operator instance used to interact with the cloud storage.
     op: Operator,
 }
 
 impl Uploader {
+    /// Creates a new `Uploader` instance.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `op` - An `Operator` instance for cloud storage operations.
     pub fn new(op: Operator) -> Self {
         Self { op }
     }
 
-    /// # 获取适合当前系统的并发限制
+    /// Calculates a suitable concurrency limit for the current system.
     /// 
-    /// 根据系统CPU核心数和其他因素计算合理的并发数
+    /// This method determines the concurrency limit based on the number of CPU cores,
+    /// ensuring efficient utilization of system resources for I/O-bound tasks.
+    /// 
+    /// # Returns
+    /// 
+    /// A `usize` value representing the concurrency limit.
     fn get_concurrency_limit() -> usize {
-        // 获取系统CPU核心数
+        // Get the number of CPU cores
         let cpu_count = num_cpus::get();
         
-        // 基础并发数: CPU核心数 * 2 (考虑到I/O绑定任务)
+        // Base concurrency limit: CPU cores * 2 (considering I/O-bound tasks)
         let base_limit = cpu_count * 2;
         
-        // 设置一个最小值和最大值，防止极端情况
+        // Set a minimum and maximum value to prevent extreme cases
         let min_limit = 4;
         let max_limit = 32;
         
         base_limit.clamp(min_limit, max_limit)
     }
 
-    /// # 获取云端文件列表（包括文件夹）
-    /// - `path` 是一个字符串，表示要列出的目录的路径。
-    /// - `recur` 是一个布尔值，指示是否递归列出目录。
+    /// Lists files and directories in the cloud storage.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `path` - A string slice representing the directory path to list.
+    /// * `recur` - A boolean indicating whether to recursively list the directory.
+    /// 
+    /// # Returns
+    /// 
+    /// A `Result` containing a vector of `opendal::Entry` on success, or an error on failure.
     pub async fn list_cloud(&self, path: &str, recur: bool) -> Result<Vec<opendal::Entry>> {
         let list = self.op.lister_with(path).recursive(recur).await?;
         Ok(list.try_collect::<Vec<_>>().await?)
     }
 
+    /// Uploads multiple files to the cloud storage.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `files` - A vector of `PathBuf` representing the local file paths to upload.
+    /// 
+    /// # Returns
+    /// 
+    /// A `Result` indicating success or failure.
     pub async fn upload_files(&self, files: Vec<PathBuf>) -> Result<()> {
         let mut set = JoinSet::new();
         
-        // 计算并发限制
+        // Calculate concurrency limit
         let concurrency_limit = Self::get_concurrency_limit();
         debug!("Using concurrency limit of {} for upload", concurrency_limit);
 
         for local_p_string in files {
-            // uploader_clone 用于在异步任务中调用方法
+            // uploader_clone is used to call methods in the async task
             let uploader_clone = self.clone();
 
             set.spawn(async move {
@@ -82,15 +112,25 @@ impl Uploader {
         Ok(())
     }
 
+    /// Uploads a single file to the cloud storage.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `local_path` - A string slice representing the local file path.
+    /// * `cloud_path` - A string slice representing the destination path in the cloud.
+    /// 
+    /// # Returns
+    /// 
+    /// A `Result` indicating success or failure.
     async fn upload_to_cloud(&self, local_path: &str, cloud_path: &str) -> Result<()> {
         use futures::AsyncWriteExt;
 
-        // 读取本地文件
+        // Read local file
         let mut f = File::open(local_path)
             .await
             .with_context(|| format!("Failed to open local file {}", local_path))?;
 
-        // 创建云端文件的写入器，写入器默认以3线程并行上传
+        // Create a writer for the cloud file, defaulting to 3-thread parallel upload
         let mut writer = self
             .op
             .writer_with(cloud_path)
@@ -102,8 +142,8 @@ impl Uploader {
         let mut uploaded = 0;
 
         info!("Uploading file {} to cloud path {}", local_path, cloud_path);
-        // 读取本地文件并写入云端
-        // 使用循环读取文件，直到 EOF
+        // Read local file and write to the cloud
+        // Use a loop to read the file until EOF
         loop {
             let n = tokio::io::AsyncReadExt::read(&mut f, &mut buf[..])
                 .await
@@ -117,7 +157,7 @@ impl Uploader {
                 .with_context(|| format!("Failed to write to cloud path {}", cloud_path))?;
             uploaded += n;
         }
-        // 关闭写入器，确保所有数据都被上传
+        // Close the writer to ensure all data is uploaded
         writer
             .close()
             .await
@@ -127,15 +167,22 @@ impl Uploader {
         Ok(())
     }
 
-    /// # 删除云端文件
-    /// - `paths` 是要删除的文件路径列表
+    /// Deletes multiple files from the cloud storage.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `paths` - A vector of `PathBuf` representing the file paths to delete.
+    /// 
+    /// # Returns
+    /// 
+    /// A `Result` indicating success or failure.
     pub async fn delete_files(&self, paths: Vec<PathBuf>) -> Result<()> {
         let mut set = JoinSet::new();
-        let concurrency_limit = Self::get_concurrency_limit(); // 动态计算并发限制
+        let concurrency_limit = Self::get_concurrency_limit(); // Dynamically calculate concurrency limit
         info!("Using concurrency limit of {} for deletion", concurrency_limit);
 
         for path in paths {
-            // 为每个文件创建一个独立的任务进行删除
+            // Create a separate task for each file to delete
             let uploader_clone = self.clone();
             let path_clone = path.clone(); // Clone PathBuf for the async task
             set.spawn(async move {
@@ -156,7 +203,15 @@ impl Uploader {
         Ok(())
     }
 
-    /// # 从云端删除单个文件
+    /// Deletes a single file from the cloud storage.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `path` - A string slice representing the file path to delete.
+    /// 
+    /// # Returns
+    /// 
+    /// A `Result` indicating success or failure.
     async fn delete_from_cloud(&self, path: &str) -> Result<()> {
         info!("Deleting file from cloud: {}", path);
 

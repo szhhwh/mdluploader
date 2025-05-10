@@ -13,12 +13,12 @@ enum State {
     CollectingUrl,
 }
 
-/// 替换 Markdown 内容中的图片链接
+/// Replace image links in Markdown content
 /// # Arguments
-/// - `content` - Markdown 文件内容
-/// - `path_map` - 本地图片路径到 S3 URL 的映射
+/// - `content` - Markdown file content
+/// - `path_map` - Mapping from local image paths to S3 URLs
 /// # Return
-/// - 替换图片链接后的 Markdown 内容
+/// - Markdown content with replaced image links
 pub fn link_replacer(content: &str, path_map: &std::collections::HashMap<String, Url>) -> String {
     let mut result = String::new();
     let mut state = State::Normal;
@@ -33,7 +33,7 @@ pub fn link_replacer(content: &str, path_map: &std::collections::HashMap<String,
     while current_pos < chars.len() {
         let ch = chars[current_pos];
         
-        // 处理代码块
+        // Process code blocks
         if ch == '`' {
             code_fence_count += 1;
             if code_fence_count == 3 {
@@ -44,7 +44,7 @@ pub fn link_replacer(content: &str, path_map: &std::collections::HashMap<String,
             code_fence_count = 0;
         }
 
-        // 如果在代码块内，跳过替换
+        // Skip replacement if inside a code block
         if is_code_block {
             result.push(ch);
             current_pos += 1;
@@ -93,7 +93,7 @@ pub fn link_replacer(content: &str, path_map: &std::collections::HashMap<String,
             }
             State::OpenParenthesisFound => {
                 if ch == ')' {
-                    // 空URL的情况
+                    // Case of empty URL
                     state = State::Normal;
                     result.push(ch);
                     current_pos += 1;
@@ -105,24 +105,24 @@ pub fn link_replacer(content: &str, path_map: &std::collections::HashMap<String,
             }
             State::CollectingUrl => {
                 if ch == ')' {
-                    // URL收集完成，检查是否需要替换
+                    // URL collection complete, check if replacement is needed
                     let local_path = PathBuf::from(&current_url).file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string();
                     
-                    // 尝试解析绝对路径
+                    // Try to parse absolute path
                     if let Some(s3_url) = path_map.get(&local_path) {
-                        // 替换为S3 URL
-                        trace!("替换图片链接: {} -> {}", current_url, s3_url);
+                        // Replace with S3 URL
+                        trace!("Replacing image link: {} -> {}", current_url, s3_url);
                         result.push_str(s3_url.as_str());
                     } else {
-                        // 如果没有匹配项，保持原有URL
-                        trace!("未找到替换项，保持原有链接: {}", current_url);
+                        // If no match is found, keep the original URL
+                        trace!("No replacement found, keeping original link: {}", current_url);
                         result.push_str(&current_url);
                     }
                     
-                    result.push(ch); // 添加闭括号
+                    result.push(ch); // Add closing parenthesis
                     current_url.clear();
                     alt_text.clear();
                     state = State::Normal;
@@ -134,9 +134,9 @@ pub fn link_replacer(content: &str, path_map: &std::collections::HashMap<String,
         }
     }
     
-    // 处理结束时的状态
+    // Handle the state at the end
     if state == State::CollectingUrl && !current_url.is_empty() {
-        // 如果结束时正在收集URL，添加已收集的部分
+        // If we're collecting a URL at the end, add the collected part
         result.push_str(&current_url);
     }
     
@@ -162,7 +162,7 @@ pub fn extract_img_urls(content: &str) -> Option<Vec<PathBuf>> {
             code_fence_count = 0;
         }
 
-        // 如果在代码块内，跳过图片链接解析
+        // Skip image link parsing if inside a code block
         if is_code_block {
             continue;
         }
@@ -184,19 +184,19 @@ pub fn extract_img_urls(content: &str) -> Option<Vec<PathBuf>> {
                 if ch == ']' {
                     state = State::ClosingSquareBracketFound;
                 }
-                // 忽略其他字符，继续收集方括号内的内容
+                // Ignore other characters, continue collecting content inside square brackets
             }
             State::ClosingSquareBracketFound => {
                 if ch == '(' {
                     state = State::OpenParenthesisFound;
-                    // 找到开括号，准备收集URL
+                    // Found opening parenthesis, preparing to collect URL
                 } else {
-                    state = State::Normal; // 如果后面不是(，回到初始状态
+                    state = State::Normal; // If not followed by (, return to initial state
                 }
             }
             State::OpenParenthesisFound => {
                 if ch == ')' {
-                    // 空URL的情况
+                    // Case of empty URL
                     state = State::Normal;
                 } else {
                     current_url.push(ch);
@@ -205,7 +205,7 @@ pub fn extract_img_urls(content: &str) -> Option<Vec<PathBuf>> {
             }
             State::CollectingUrl => {
                 if ch == ')' {
-                    // URL收集完成，添加并重置
+                    // URL collection complete, add and reset
                     urls.push(current_url.clone().into());
                     current_url.clear();
                     state = State::Normal;
@@ -216,7 +216,7 @@ pub fn extract_img_urls(content: &str) -> Option<Vec<PathBuf>> {
         }
     }
     
-    // 处理可能的不完整语法情况 - 如果结束时不是Normal状态且收集了URL
+    // Handle potential incomplete syntax - if we're not in Normal state at the end and URL was collected
     if state == State::CollectingUrl && !current_url.is_empty() {
         current_url.clear();
     }
@@ -234,7 +234,7 @@ mod link_extractor_test {
 
     #[test]
     fn test_extract_single_image() {
-        let content = "这是一个带有图片的 Markdown：![图片描述](path/to/image.jpg)";
+        let content = "This is a Markdown with an image: ![Image description](path/to/image.jpg)";
         let result = extract_img_urls(content);
         assert!(result.is_some());
         let urls = result.unwrap();
@@ -244,7 +244,7 @@ mod link_extractor_test {
 
     #[test]
     fn test_extract_multiple_images() {
-        let content = "这是多张图片：![图片1](image1.png) 文字 ![图片2](image2.jpg)";
+        let content = "These are multiple images: ![Image1](image1.png) Text ![Image2](image2.jpg)";
         let result = extract_img_urls(content);
         assert!(result.is_some());
         let urls = result.unwrap();
@@ -255,21 +255,21 @@ mod link_extractor_test {
 
     #[test]
     fn test_no_images() {
-        let content = "这是没有图片的 Markdown 文本";
+        let content = "This is a Markdown text without images";
         let result = extract_img_urls(content);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_incomplete_markdown_syntax() {
-        let content = "这是不完整的语法: ![图片描述](path/to/image.jpg";
+        let content = "This is an incomplete syntax: ![Image description](path/to/image.jpg";
         let result = extract_img_urls(content);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_with_code_blocks() {
-        let content = "代码块中的图片语法不应该被提取：\n```\n![图片](image.png)\n```\n但这个应该被提取：![真实图片](real_image.jpg)";
+        let content = "The image syntax in code blocks should not be extracted:\n```\n![Image](image.png)\n```\nBut this one should be extracted: ![Real image](real_image.jpg)";
         let result = extract_img_urls(content);
         assert!(result.is_some());
         let urls = result.unwrap();

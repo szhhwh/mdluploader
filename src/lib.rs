@@ -16,19 +16,19 @@ impl FileInfo {
         FileInfo { path, md5 }
     }
 
-    /// 获取文件路径
+    /// Get File Path
     /// # Return
     /// - &String
     pub fn get_path(&self) -> &std::path::PathBuf {
         &self.path
     }
 
-    /// 获取文件 MD5
+    /// Get File MD5
     /// # Return
     /// - &String
     /// # Note
-    /// - MD5 值是一个 32 位的十六进制字符串
-    /// - 例如：`"d41d8cd98f00b204e9800998ecf8427e"`
+    /// - The MD5 value is a 32-character hexadecimal string.
+    /// - Example: `"d41d8cd98f00b204e9800998ecf8427e"`
     pub fn get_md5(&self) -> &String {
         &self.md5
     }
@@ -56,19 +56,19 @@ impl std::cmp::PartialEq for FileInfo {
     }
 }
 
-/// 读取指定路径下的文件列表
+/// Read the file list under the specified path
 /// # Arguments
-/// - `path` - 要读取的路径
-/// - `depth` - 递归深度
+/// - `path` - The path to read
+/// - `depth` - Recursion depth
 /// # Return
-/// - `Result<Vec<walkdir::DirEntry>, std::io::Error>` - 返回文件列表或错误
+/// - `Result<Vec<walkdir::DirEntry>, std::io::Error>` - Returns the file list or an error
 pub fn read_file_list<P: AsRef<Path> + Debug>(
     path: &P,
     depth: &usize,
 ) -> Result<Vec<walkdir::DirEntry>> {
-    // 创建文件列表
+    // Create file list
     let mut file_list: Vec<walkdir::DirEntry> = Vec::new();
-    // 遍历目录
+    // Traverse directory
     debug!("traversing directory: {:?}", path);
     for item in WalkDir::new(path).max_depth(*depth) {
         file_list.push(item?);
