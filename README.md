@@ -34,6 +34,8 @@ mdluploader upload /path/to/markdown/folder \
   --sk SECRET_KEY \
   --region us-west-1 \
   --endpoint https://s3.us-west-1.amazonaws.com \
+  --remote-root remote_dir
+  --domain https://www.example.com \
   --depth 5
 ```
 
@@ -50,6 +52,8 @@ mdluploader upload /path/to/markdown/folder \
 - `--sk`: S3密钥（必需）
 - `--region`: S3区域（必需）
 - `--endpoint`: S3端点URL（必需）
+- `--remote-root`: S3远端目录（必须）
+- `--domain, -d`: S3自定义访问域名（必须）
 - `--depth, -d`: 扫描的最大目录深度（默认值：10）
 
 ## 工作原理
