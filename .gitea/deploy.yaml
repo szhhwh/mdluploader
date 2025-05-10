@@ -20,7 +20,7 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Deploy
-        uses: saltbo/uptoc@master
+        uses: saltbo/uptoc@v1.4.3
         with:
           driver: qiniu
           region: ${{ secrets.QINIU_REGION }}
