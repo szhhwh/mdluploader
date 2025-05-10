@@ -85,7 +85,7 @@ pub fn extract_img_urls(content: &str) -> Option<Vec<PathBuf>> {
     
     // 处理可能的不完整语法情况 - 如果结束时不是Normal状态且收集了URL
     if state == State::CollectingUrl && !current_url.is_empty() {
-        // Markdown语法不完整，不应添加该URL
+        current_url.clear();
     }
     
     if urls.is_empty() {

@@ -33,7 +33,6 @@ async fn main() -> Result<()> {
             endpoint,
             remote_root,
         } => {
-            info!("Uploading files...");
             let op = AwsS3::new(
                 bucket,
                 ak,
@@ -51,6 +50,8 @@ async fn main() -> Result<()> {
 }
 
 async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> {
+    info!("Starting to upload files...");
+    debug!("Source path: {:?}", md_src_path);
     // 读取给定路径下所有文件以及文件夹
     let files = read_file_list(&md_src_path, &depth)?;
 
@@ -65,6 +66,7 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
             let p = PathBuf::from(x.path());
             if p.try_exists().unwrap_or(false) {
                 if p.extension().unwrap() == "md" {
+                    trace!("Valid file detected: {:?}", p);
                     Some(p)
                 } else {
                     None
@@ -156,6 +158,8 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
         info!("开始替换文件...");
         uploader.upload_files(replacelist).await?;
     }
+
+    
 
     Ok(())
 }
