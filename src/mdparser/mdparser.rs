@@ -96,7 +96,7 @@ pub fn extract_img_urls(content: &str) -> Option<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
-mod tests {
+mod link_extractor_test {
     use super::*;
 
     #[test]
