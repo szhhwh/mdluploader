@@ -2,11 +2,10 @@ use anyhow::Result;
 use clap::Parser;
 use differ::diff;
 use log::{debug, info, trace};
-use md5::Digest;
 use mdluploader::{cli::Args, *};
 use opendal::Operator;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use std::{io::Read, path::PathBuf};
+use std::path::PathBuf;
 use uploader::{s3::AwsS3, uploader::Uploader};
 
 // Modules
@@ -85,7 +84,10 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
         .collect();
 
     // 输出所有搜寻到的图像
-    info!("{} img links detected in markdown files.", image_path_list.len());
+    info!(
+        "{} img links detected in markdown files.",
+        image_path_list.len()
+    );
     for item in &image_path_list {
         trace!("Image detected: {:?}", item);
     }
@@ -93,17 +95,14 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
     // 计算本地图片MD5值
     let local_img_list: Vec<FileInfo> = image_path_list
         .par_iter()
-        .map(|img| {
-            // 计算图片MD5值
-            trace!("Calculating MD5 for {:?}", img);
-            let mut md = md5::Md5::new();
-            let mut img_content = vec![];
-            let _ = std::fs::File::open(img)
-                .unwrap()
-                .read_to_end(&mut img_content);
-            md.update(img_content);
-            let md = md.finalize();
-            FileInfo::new(img.clone(), format!("{:x}", md))
+        .filter_map(|img| {
+            match get_file_md5(img) {
+                Ok(md5) => Some(FileInfo::new(img.clone(), md5)),
+                Err(e) => {
+                    log::error!("Failed to get MD5 for {:?}: {}", img, e);
+                    None
+                }
+            }
         })
         .collect();
 
@@ -159,8 +158,6 @@ async fn upload(md_src_path: PathBuf, depth: usize, op: Operator) -> Result<()> 
         uploader.upload_files(replacelist).await?;
     }
 
-    
-
     Ok(())
 }
 
@@ -187,7 +184,10 @@ fn resolve_image_path(img_path: PathBuf, md_file_path: &PathBuf) -> Option<PathB
 
     // 处理相对路径
     let parent_dir = md_file_path.parent()?;
-    let full_path = PathBuf::from(parent_dir).join(img_path).canonicalize().ok()?;
+    let full_path = PathBuf::from(parent_dir)
+        .join(img_path)
+        .canonicalize()
+        .ok()?;
 
     if full_path.try_exists().unwrap_or(false) {
         Some(full_path)

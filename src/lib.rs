@@ -1,6 +1,8 @@
 pub mod cli;
 
-use log::debug;
+use anyhow::{Ok, Result};
+use log::{debug, trace};
+use md5::Digest;
 use std::{fmt::Debug, path::Path};
 use walkdir::WalkDir;
 
@@ -63,7 +65,7 @@ impl std::cmp::PartialEq for FileInfo {
 pub fn read_file_list<P: AsRef<Path> + Debug>(
     path: &P,
     depth: &usize,
-) -> Result<Vec<walkdir::DirEntry>, std::io::Error> {
+) -> Result<Vec<walkdir::DirEntry>> {
     // 创建文件列表
     let mut file_list: Vec<walkdir::DirEntry> = Vec::new();
     // 遍历目录
@@ -72,4 +74,14 @@ pub fn read_file_list<P: AsRef<Path> + Debug>(
         file_list.push(item?);
     }
     Ok(file_list)
+}
+
+pub fn get_file_md5<P: AsRef<Path>>(img: &P) -> Result<String> {
+    let mut md = md5::Md5::new();
+    let mut img_content = vec![];
+    let _ = std::io::Read::read_to_end(&mut std::fs::File::open(img)?, &mut img_content);
+    md.update(&img_content);
+    let md = md.finalize();
+    trace!("MD5: {:x}", md);
+    Ok(format!("{:x}", md))
 }
