@@ -52,6 +52,9 @@ pub fn diff(
     let mut remote_sorted = remote;
     remote_sorted.sort_unstable();
 
+    trace!("Local files sorted: {:?}", local_sorted);
+    trace!("Remote files sorted: {:?}", remote_sorted);
+
     trace!("Finished sorting local and remote files");
 
     // Index
