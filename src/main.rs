@@ -19,7 +19,6 @@ mod uploader;
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
-    std::env::set_var("RUST_LOG", "trace");
     env_logger::init();
 
     let args = Args::parse();
