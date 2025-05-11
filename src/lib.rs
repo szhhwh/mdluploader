@@ -56,6 +56,21 @@ impl std::cmp::PartialEq for FileInfo {
     }
 }
 
+impl std::fmt::Debug for FileInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileInfo")
+            .field("path", &self.path)
+            .field("md5", &self.md5)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for FileInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FileInfo {{ path: {:?}, md5: {} }}", self.path, self.md5)
+    }
+}
+
 /// Read the file list under the specified path
 /// # Arguments
 /// - `path` - The path to read
