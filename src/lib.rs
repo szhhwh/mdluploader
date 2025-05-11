@@ -6,6 +6,7 @@ use md5::Digest;
 use std::{fmt::Debug, path::Path};
 use walkdir::WalkDir;
 
+#[derive(Eq)]
 pub struct FileInfo {
     path: std::path::PathBuf,
     md5: String,
@@ -34,25 +35,43 @@ impl FileInfo {
     }
 }
 
-impl std::cmp::Eq for FileInfo {
-    fn assert_receiver_is_total_eq(&self) {}
-}
-
 impl std::cmp::Ord for FileInfo {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.md5.cmp(&other.md5)
+        match self.path.file_name().cmp(&other.path.file_name()) {
+            std::cmp::Ordering::Less => std::cmp::Ordering::Less,
+            std::cmp::Ordering::Greater => std::cmp::Ordering::Greater,
+            std::cmp::Ordering::Equal => {
+                if self.md5 == other.md5 {
+                    std::cmp::Ordering::Equal
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            }
+        }
     }
 }
 
 impl std::cmp::PartialOrd for FileInfo {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.md5.partial_cmp(&other.md5)
+        match self.path.file_name().partial_cmp(&other.path.file_name()) {
+            Some(ordering) => Some(ordering),
+            None => {
+                if self.path.file_name().is_none() && other.path.file_name().is_none() {
+                    match self.md5.partial_cmp(&other.md5) {
+                        Some(ordering) => Some(ordering),
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
 impl std::cmp::PartialEq for FileInfo {
     fn eq(&self, other: &Self) -> bool {
-        self.md5 == other.md5
+        self.md5 == other.md5 && self.path.file_name() == other.path.file_name()
     }
 }
 
