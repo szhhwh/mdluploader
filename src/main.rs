@@ -88,20 +88,20 @@ async fn upload(
         .collect();
     
     // Extract local image links from each valid Markdown file
-    let image_path_list: Vec<PathBuf> = vaild_files
+    let image_path_list: HashSet<PathBuf> = vaild_files
         .par_iter()
         .filter_map(|current_mdfile_path| extract_image_paths_from_file(current_mdfile_path))
         .flatten()
         .collect();
 
     // Output all detected images
+    for item in &image_path_list {
+        trace!("Image detected: {:?}", item);
+    }
     info!(
         "{} img links detected in markdown files.",
         image_path_list.len()
     );
-    for item in &image_path_list {
-        trace!("Image detected: {:?}", item);
-    }
 
     // Calculate MD5 values for local images
     let local_img_list: Vec<FileInfo> = image_path_list
