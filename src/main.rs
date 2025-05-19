@@ -22,6 +22,10 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let args = Args::parse();
+    
+    info!("Welcome to Markdown Image Uploader!");
+    info!("Version: {}", env!("CARGO_PKG_VERSION"));
+    info!("Build time: {}", std::env::var("VERGEN_BUILD_TIMESTAMP").unwrap_or_else(|_| "unknown".to_string()));
 
     match args.command {
         cli::Commands::Upload {
