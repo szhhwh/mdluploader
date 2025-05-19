@@ -1,0 +1,26 @@
+name: dev
+run-name: Beta build — ${{ gitea.run_id }}
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened,synchronize]
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build binary
+        run: cargo build --verbose --release
+        env:
+          RUST_BACKTRACE: 1
