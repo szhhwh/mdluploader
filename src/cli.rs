@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(version)]
-#[command(about = "Mdparser")]
+#[command(about = "A command line tool to upload markdown files to cloud storage.")]
 pub struct Args {
     #[command(subcommand)]
     pub command: Commands,
