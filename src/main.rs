@@ -22,10 +22,13 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let args = Args::parse();
-    
+
     info!("Welcome to Markdown Image Uploader!");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
-    info!("Build time: {}", std::env::var("VERGEN_BUILD_TIMESTAMP").unwrap_or_else(|_| "unknown".to_string()));
+    info!(
+        "Build time: {}",
+        std::env::var("VERGEN_BUILD_TIMESTAMP").unwrap_or_else(|_| "unknown".to_string())
+    );
 
     match args.command {
         cli::Commands::Upload {
@@ -74,7 +77,7 @@ async fn upload(
     // 2. Keep only existing files
     // 3. Keep only files with .md extension
     let vaild_files: Vec<PathBuf> = files
-    .par_iter()
+        .par_iter()
         .filter(|x| x.file_type().is_file())
         .filter_map(|x| {
             let p = PathBuf::from(x.path());
@@ -90,7 +93,7 @@ async fn upload(
             }
         })
         .collect();
-    
+
     // Extract local image links from each valid Markdown file
     let image_path_list: HashSet<PathBuf> = vaild_files
         .par_iter()
@@ -109,7 +112,7 @@ async fn upload(
 
     // Calculate MD5 values for local images
     let local_img_list: Vec<FileInfo> = image_path_list
-    .par_iter()
+        .par_iter()
         .filter_map(|img| match get_file_md5(img) {
             Ok(md5) => Some(FileInfo::new(img.clone(), md5)),
             Err(e) => {
@@ -118,27 +121,27 @@ async fn upload(
             }
         })
         .collect();
-    
+
     // Fetch file list from cloud
     trace!("Starting to list cloud files...");
     let list = Uploader::new(op.clone()).list_cloud("/", true).await?;
     let remote_img_list: Vec<FileInfo> = list
-    .par_iter()
-    .map(|entry| {
-        FileInfo::new(
-            PathBuf::from(entry.path().to_string()),
-            entry.metadata().content_md5().unwrap().to_string(),
-        )
-    })
-    .collect();
-trace!("Finished list cloud files.");
+        .par_iter()
+        .map(|entry| {
+            FileInfo::new(
+                PathBuf::from(entry.path().to_string()),
+                entry.metadata().content_md5().unwrap().to_string(),
+            )
+        })
+        .collect();
+    trace!("Finished list cloud files.");
 
-// Compare cloud files and local files to find files that need to be uploaded
-let (uploadlist, deletelist, replacelist) = diff::diff(local_img_list, remote_img_list)?;
+    // Compare cloud files and local files to find files that need to be uploaded
+    let (uploadlist, deletelist, replacelist) = diff::diff(local_img_list, remote_img_list)?;
 
-// Output difference lists
-info!("{} files need to be uploaded.", uploadlist.len());
-for item in &uploadlist {
+    // Output difference lists
+    info!("{} files need to be uploaded.", uploadlist.len());
+    for item in &uploadlist {
         debug!("File to upload: {:?}", item);
     }
     info!("{} files need to be deleted.", deletelist.len());
@@ -149,11 +152,11 @@ for item in &uploadlist {
     for item in &replacelist {
         debug!("File to replace: {:?}", item);
     }
-    
+
     info!("Starting to upload files...");
     // Create uploader instance
     let uploader = Uploader::new(op.clone());
-    
+
     // Process files that need to be uploaded
     if !uploadlist.is_empty() {
         info!("Starting to upload files...");
@@ -194,7 +197,10 @@ for item in &uploadlist {
                 file_names
             }
             Err(e) => {
-                warn!("Failed to get cloud file list: {}, skipping link replacement", e);
+                warn!(
+                    "Failed to get cloud file list: {}, skipping link replacement",
+                    e
+                );
                 HashSet::new()
             }
         };
@@ -225,7 +231,10 @@ for item in &uploadlist {
                         }
                     }
                 } else {
-                    debug!("File does not exist in S3: {}, skipping link replacement", file_name_str);
+                    debug!(
+                        "File does not exist in S3: {}, skipping link replacement",
+                        file_name_str
+                    );
                 }
             }
         }

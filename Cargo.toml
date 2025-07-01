@@ -19,3 +19,6 @@ walkdir = "2.5.0"
 num_cpus = "1.16"
 clap_complete = "4.5.50"
 url = "2.5.4"
+
+[build-dependencies]
+vergen = { version = "9.0.0", features = ["build"] }
