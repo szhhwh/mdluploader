@@ -1,13 +1,40 @@
-use std::path::PathBuf;
-
 use anyhow::{Context, Ok, Result};
 use futures::TryStreamExt;
 use log::{debug, error, info, trace};
 use opendal::Operator;
+use std::path::PathBuf;
 use tokio::{fs::File, task::JoinSet};
 
+/// Represents a file to be uploaded to the cloud storage.
+#[derive(Debug, Clone)]
+pub struct UpFile {
+    /// The local file path to be uploaded.
+    pub local_path: PathBuf,
+    /// The destination path in the cloud storage.
+    pub cloud_path: String,
+}
+
+impl UpFile {
+    pub fn from_pathbuf(local_path: &PathBuf, src: &PathBuf) -> Result<Self> {
+        let relative_path = local_path.strip_prefix(src).with_context(|| {
+            format!(
+                "Path {} is not under base path {}",
+                local_path.display(),
+                src.display()
+            )
+        })?;
+
+        let cloud_path = relative_path.to_string_lossy().to_string();
+
+        Ok(Self {
+            local_path: local_path.clone(),
+            cloud_path,
+        })
+    }
+}
+
 /// Represents an uploader that interacts with a cloud storage system.
-/// 
+///
 /// This struct provides methods to upload, list, and delete files in the cloud.
 #[derive(Clone)]
 pub struct Uploader {
@@ -17,45 +44,45 @@ pub struct Uploader {
 
 impl Uploader {
     /// Creates a new `Uploader` instance.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `op` - An `Operator` instance for cloud storage operations.
     pub fn new(op: Operator) -> Self {
         Self { op }
     }
 
     /// Calculates a suitable concurrency limit for the current system.
-    /// 
+    ///
     /// This method determines the concurrency limit based on the number of CPU cores,
     /// ensuring efficient utilization of system resources for I/O-bound tasks.
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// A `usize` value representing the concurrency limit.
     fn get_concurrency_limit() -> usize {
         // Get the number of CPU cores
         let cpu_count = num_cpus::get();
-        
+
         // Base concurrency limit: CPU cores * 2 (considering I/O-bound tasks)
         let base_limit = cpu_count * 2;
-        
+
         // Set a minimum and maximum value to prevent extreme cases
         let min_limit = 4;
         let max_limit = 32;
-        
+
         base_limit.clamp(min_limit, max_limit)
     }
 
     /// Lists files and directories in the cloud storage.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `path` - A string slice representing the directory path to list.
     /// * `recur` - A boolean indicating whether to recursively list the directory.
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// A `Result` containing a vector of `opendal::Entry` on success, or an error on failure.
     pub async fn list_cloud(&self, path: &str, recur: bool) -> Result<Vec<opendal::Entry>> {
         let list = self.op.lister_with(path).recursive(recur).await?;
@@ -63,20 +90,23 @@ impl Uploader {
     }
 
     /// Uploads multiple files to the cloud storage.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `files` - A vector of `PathBuf` representing the local file paths to upload.
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// A `Result` indicating success or failure.
-    pub async fn upload_files(&self, files: Vec<PathBuf>) -> Result<()> {
+    pub async fn upload_files(&self, files: Vec<UpFile>) -> Result<()> {
         let mut set = JoinSet::new();
-        
+
         // Calculate concurrency limit
         let concurrency_limit = Self::get_concurrency_limit();
-        debug!("Using concurrency limit of {} for upload", concurrency_limit);
+        debug!(
+            "Using concurrency limit of {} for upload",
+            concurrency_limit
+        );
 
         for local_p_string in files {
             // uploader_clone is used to call methods in the async task
@@ -87,16 +117,16 @@ impl Uploader {
                 // Use the cloned PathBuf in the async task
                 if let Err(e) = uploader_clone
                     .upload_to_cloud(
-                        local_p_string.to_string_lossy().as_ref(),
-                        local_p_string
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                            .as_ref(),
+                        local_p_string.local_path.to_string_lossy().as_ref(),
+                        local_p_string.cloud_path.as_str(),
                     )
                     .await
                 {
-                    error!("Error uploading file {}: {}", local_p_string.display(), e);
+                    error!(
+                        "Error uploading file {}: {}",
+                        local_p_string.local_path.display(),
+                        e
+                    );
                 }
             });
 
@@ -113,14 +143,14 @@ impl Uploader {
     }
 
     /// Uploads a single file to the cloud storage.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `local_path` - A string slice representing the local file path.
     /// * `cloud_path` - A string slice representing the destination path in the cloud.
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// A `Result` indicating success or failure.
     async fn upload_to_cloud(&self, local_path: &str, cloud_path: &str) -> Result<()> {
         use futures::AsyncWriteExt;
@@ -168,26 +198,28 @@ impl Uploader {
     }
 
     /// Deletes multiple files from the cloud storage.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `paths` - A vector of `PathBuf` representing the file paths to delete.
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// A `Result` indicating success or failure.
-    pub async fn delete_files(&self, paths: Vec<PathBuf>) -> Result<()> {
+    pub async fn delete_files(&self, paths: Vec<UpFile>) -> Result<()> {
         let mut set = JoinSet::new();
         let concurrency_limit = Self::get_concurrency_limit(); // Dynamically calculate concurrency limit
-        info!("Using concurrency limit of {} for deletion", concurrency_limit);
+        info!(
+            "Using concurrency limit of {} for deletion",
+            concurrency_limit
+        );
 
         for path in paths {
             // Create a separate task for each file to delete
             let uploader_clone = self.clone();
-            let path_clone = path.clone(); // Clone PathBuf for the async task
             set.spawn(async move {
-                if let Err(e) = uploader_clone.delete_from_cloud(&path_clone.to_string_lossy().as_ref()).await {
-                    error!("Error deleting file {}: {}", path_clone.display(), e);
+                if let Err(e) = uploader_clone.delete_from_cloud(&path.cloud_path).await {
+                    error!("Error deleting file {}: {}", path.cloud_path, e);
                 }
             });
 
@@ -204,13 +236,13 @@ impl Uploader {
     }
 
     /// Deletes a single file from the cloud storage.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `path` - A string slice representing the file path to delete.
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// A `Result` indicating success or failure.
     async fn delete_from_cloud(&self, path: &str) -> Result<()> {
         info!("Deleting file from cloud: {}", path);

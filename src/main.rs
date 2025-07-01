@@ -8,7 +8,7 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
-use uploader::{s3::AwsS3, uploader::Uploader};
+use uploader::{s3::AwsS3, uploader::UpFile, uploader::Uploader};
 use url::Url;
 
 // Modules
@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         std::env::set_var("RUST_LOG", "info");
     }
     env_logger::init();
-
+    
     let args = Args::parse();
 
     info!("Welcome to Markdown Image Uploader!");
@@ -155,6 +155,26 @@ async fn upload(
     for item in &replacelist {
         debug!("File to replace: {:?}", item);
     }
+
+    // Convert all PathBuf to UpFile, which contains both local path and cloud path
+    let md_src_path = md_src_path // Ensure the source path is canonicalized
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize source path: {:?}", md_src_path))?;
+
+    let uploadlist: Vec<UpFile> = uploadlist
+        .par_iter()
+        .map(|file| UpFile::from_pathbuf(file, &md_src_path).unwrap())
+        .collect();
+
+    let deletelist: Vec<UpFile> = deletelist
+        .par_iter()
+        .map(|file| UpFile::from_pathbuf(file, &md_src_path).unwrap())
+        .collect();
+
+    let replacelist: Vec<UpFile> = replacelist
+        .par_iter()
+        .map(|file| UpFile::from_pathbuf(file, &md_src_path).unwrap())
+        .collect();
 
     info!("Starting to upload files...");
     // Create uploader instance
