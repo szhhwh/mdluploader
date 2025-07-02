@@ -153,47 +153,23 @@ impl Uploader {
     ///
     /// A `Result` indicating success or failure.
     async fn upload_to_cloud(&self, local_path: &str, cloud_path: &str) -> Result<()> {
-        use futures::AsyncWriteExt;
-
-        // Read local file
-        let mut f = File::open(local_path)
+        let f = File::open(local_path)
             .await
             .with_context(|| format!("Failed to open local file {}", local_path))?;
 
-        // Create a writer for the cloud file, defaulting to 3-thread parallel upload
-        let mut writer = self
-            .op
+        let file_metadata = f.metadata().await?;
+        let file_size = file_metadata.len();
+
+        info!(
+            "Uploading file {} to cloud path {} with size {} bytes",
+            local_path, cloud_path, file_size
+        );
+
+        self.op
             .writer_with(cloud_path)
             .concurrent(3)
             .await
-            .with_context(|| format!("Failed to create writer for cloud path {}", cloud_path))?
-            .into_futures_async_write();
-        let mut buf = [0_u8; 8192];
-        let mut uploaded = 0;
-
-        info!("Uploading file {} to cloud path {}", local_path, cloud_path);
-        // Read local file and write to the cloud
-        // Use a loop to read the file until EOF
-        loop {
-            let n = tokio::io::AsyncReadExt::read(&mut f, &mut buf[..])
-                .await
-                .with_context(|| format!("Failed to read from local file {}", local_path))?;
-            if n == 0 {
-                break;
-            }
-            writer
-                .write_all(&buf[..n])
-                .await
-                .with_context(|| format!("Failed to write to cloud path {}", cloud_path))?;
-            uploaded += n;
-        }
-        // Close the writer to ensure all data is uploaded
-        writer
-            .close()
-            .await
-            .with_context(|| format!("Failed to finalize upload to {}", cloud_path))?;
-
-        debug!("Total file upload of {} bytes.", uploaded);
+            .with_context(|| format!("Failed to create writer for cloud path {}", cloud_path))?;
         Ok(())
     }
 
