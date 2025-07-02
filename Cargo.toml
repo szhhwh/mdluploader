@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "A tool to upload files to S3 using MD5 checksum for verification."
+build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.98"

@@ -23,14 +23,18 @@ async fn main() -> Result<()> {
         std::env::set_var("RUST_LOG", "info");
     }
     env_logger::init();
-    
+
     let args = Args::parse();
 
     info!("Welcome to Markdown Image Uploader!");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
     info!(
         "Build time: {}",
-        std::env::var("VERGEN_BUILD_TIMESTAMP").unwrap_or_else(|_| "unknown".to_string())
+        if let Some(timestamp) = option_env!("VERGEN_BUILD_TIMESTAMP") {
+            timestamp
+        } else {
+            "Unknown Build Time"
+        }
     );
 
     match args.command {
