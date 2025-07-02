@@ -125,9 +125,12 @@ async fn upload(
         })
         .collect();
 
+    // Create uploader instance
+    let uploader = Uploader::new(op);
+
     // Fetch file list from cloud
     trace!("Starting to list cloud files...");
-    let list = Uploader::new(op.clone()).list_cloud("/", true).await?;
+    let list = uploader.list_cloud("/", true).await?;
     let remote_img_list: Vec<FileInfo> = list
         .par_iter()
         .map(|entry| {
@@ -177,9 +180,6 @@ async fn upload(
         .collect();
 
     info!("Starting to upload files...");
-    // Create uploader instance
-    let uploader = Uploader::new(op.clone());
-
     // Process files that need to be uploaded
     if !uploadlist.is_empty() {
         info!("Starting to upload files...");
@@ -208,7 +208,7 @@ async fn upload(
 
         // Get file list from cloud to verify file existence in S3
         debug!("Getting S3 cloud file list to verify file existence...");
-        let cloud_files = match Uploader::new(op.clone()).list_cloud("/", true).await {
+        let cloud_files = match uploader.list_cloud("/", true).await {
             Ok(files) => {
                 let file_names: HashSet<String> = files
                     .par_iter()
