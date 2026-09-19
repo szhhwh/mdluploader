@@ -108,7 +108,7 @@ async fn upload(
     // Extract local image links from each valid Markdown file
     let image_path_list: HashSet<PathBuf> = vaild_files
         .par_iter()
-        .filter_map(|current_mdfile_path| extract_image_paths_from_file(current_mdfile_path))
+        .map(|current_mdfile_path| extract_image_paths_from_file(current_mdfile_path))
         .flatten()
         .collect();
 
@@ -237,10 +237,8 @@ async fn upload(
 
                     // Iterate through all Markdown files to find files containing this image
                     for md_file in &vaild_files {
-                        if let Some(img_paths) = extract_image_paths_from_file(md_file) {
-                            if img_paths.contains(img_path) {
-                                affected_md_files.insert(md_file.clone());
-                            }
+                        if extract_image_paths_from_file(md_file).contains(img_path) {
+                            affected_md_files.insert(md_file.clone());
                         }
                     }
                 } else {
@@ -258,8 +256,16 @@ async fn upload(
 
             // Read Markdown file content
             if let Ok(content) = std::fs::read_to_string(&md_file) {
-                // Execute link replacement
-                let new_content = mdparser::mdparser::link_replacer(&content, &path_map);
+                // Execute link replacement: resolve each raw destination to a
+                // known uploaded image by file name.
+                let new_content = mdparser::mdparser::replace_image_links(&content, |dest| {
+                    let decoded = mdparser::mdparser::percent_decode(dest);
+                    let name = PathBuf::from(&decoded)
+                        .file_name()?
+                        .to_string_lossy()
+                        .to_string();
+                    path_map.get(&name).map(|u| u.to_string())
+                });
 
                 // Write back to file
                 if let Err(e) = std::fs::write(&md_file, new_content) {
@@ -279,17 +285,17 @@ async fn upload(
 }
 
 /// Extract all valid image paths from a single Markdown file
-fn extract_image_paths_from_file(current_mdfile_path: &PathBuf) -> Option<Vec<PathBuf>> {
+fn extract_image_paths_from_file(current_mdfile_path: &PathBuf) -> Vec<PathBuf> {
     let buff = match std::fs::read_to_string(current_mdfile_path) {
         Ok(content) => content,
-        Err(_) => return None,
+        Err(_) => return Vec::new(),
     };
 
-    mdparser::mdparser::extract_img_urls(&buff).map(|urls| {
-        urls.into_iter()
-            .filter_map(|img_path| resolve_image_path(img_path, current_mdfile_path))
-            .collect()
-    })
+    mdparser::mdparser::extract_image_links(&buff)
+        .into_iter()
+        .map(|dest| PathBuf::from(mdparser::mdparser::percent_decode(&dest)))
+        .filter_map(|img_path| resolve_image_path(img_path, current_mdfile_path))
+        .collect()
 }
 
 /// Resolve image path
