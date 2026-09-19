@@ -73,12 +73,15 @@ impl AwsS3 {
             .secret_access_key(&self.sk)
             .region(&self.region)
             .root(&self.root)
-            .endpoint(&self.ep);
+            .endpoint(&self.ep)
+            // Sends a Content-MD5 header with every write so S3 verifies
+            // the upload server-side instead of the client blindly
+            // trusting its own transfer.
+            .checksum_algorithm("md5");
 
         let op = Operator::new(builder)?
             .layer(LoggingLayer::default())
-            .layer(ConcurrentLimitLayer::new(1024))
-            .finish();
+            .layer(ConcurrentLimitLayer::new(1024));
 
         Ok(op)
     }

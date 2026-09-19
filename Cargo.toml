@@ -15,7 +15,7 @@ log = "0.4.27"
 md-5 = "0.10.6"
 pulldown-cmark = { version = "0.13", default-features = false }
 percent-encoding = "2.3"
-opendal = { version = "0.53.1", features = ["services-s3"] }
+opendal = { version = "0.59", features = ["services-s3"] }
 rayon = "1.10.0"
 tokio = { version = "1.45.0", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 walkdir = "2.5.0"
@@ -24,7 +24,7 @@ url = "2.5.4"
 
 [dev-dependencies]
 tempfile = "3"
-opendal = { version = "0.53.1", features = ["services-memory"] }
+opendal = { version = "0.59", features = ["services-memory"] }
 
 [build-dependencies]
 vergen = { version = "9.0.0", features = ["build"] }

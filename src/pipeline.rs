@@ -128,7 +128,7 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
     let mut initial_remote: Vec<CloudPath> = Vec::with_capacity(entries.len());
     let mut remote_images: Vec<RemoteImage> = Vec::with_capacity(entries.len());
     for entry in entries {
-        let md5 = entry.metadata().content_md5().and_then(remote_md5);
+        let md5 = entry_md5(entry.metadata());
         let cloud_path = CloudPath::new(entry.path());
         initial_remote.push(cloud_path.clone());
         remote_images.push(RemoteImage { cloud_path, md5 });
@@ -235,6 +235,16 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
     }
     info!("Pipeline finished.");
     Ok(())
+}
+
+/// Extracts the comparable MD5 from a cloud listing entry's metadata.
+///
+/// S3 listings expose the checksum through the ETag: for single-part
+/// uploads it IS the content MD5 (quoted), while multipart ETags carry a
+/// `-N` suffix that [`remote_md5`] rejects. OpenDAL 0.59 stopped mirroring
+/// the ETag into `content_md5()`, so the diff must read the ETag directly.
+fn entry_md5(metadata: &opendal::Metadata) -> Option<String> {
+    metadata.etag().and_then(remote_md5)
 }
 
 /// Scans the source tree for markdown files, resolving their local images
@@ -715,6 +725,27 @@ mod tests {
     }
 
     #[test]
+    fn entry_md5_reads_etag_not_content_md5() {
+        // OpenDAL 0.59 stopped mirroring listing ETags into content_md5();
+        // if this helper reads the wrong field, every remote object looks
+        // checksum-unknown and replacements silently never trigger.
+        let mut builder = opendal::MetadataBuilder::file(0);
+        builder.etag("\"5d41402abc4b2a76b9719d911017c592\"");
+        assert_eq!(
+            entry_md5(&builder.build()),
+            Some("5d41402abc4b2a76b9719d911017c592".to_string())
+        );
+
+        // Multipart ETags are not content MD5s and must stay unknown.
+        let mut multipart = opendal::MetadataBuilder::file(0);
+        multipart.etag("\"d41d8cd98f00b204e9800998ecf8427e-7\"");
+        assert_eq!(entry_md5(&multipart.build()), None);
+
+        // No ETag at all (e.g. the memory backend) stays unknown.
+        assert_eq!(entry_md5(&opendal::MetadataBuilder::file(0).build()), None);
+    }
+
+    #[test]
     fn final_remote_set_applies_deletes_and_additions() {
         let initial = vec![CloudPath::new("a.png"), CloudPath::new("b.png")];
         let deletes = vec![CloudPath::new("a.png")];
@@ -825,7 +856,7 @@ mod pipeline_e2e_tests {
     use opendal::services;
 
     fn memory_op() -> Operator {
-        Operator::new(services::Memory::default()).unwrap().finish()
+        Operator::new(services::Memory::default()).unwrap()
     }
 
     async fn run_once(op: &Operator, src: &Path) -> Result<()> {

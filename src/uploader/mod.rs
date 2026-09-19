@@ -315,7 +315,7 @@ mod tests {
     use opendal::services;
 
     fn memory_op() -> Operator {
-        Operator::new(services::Memory::default()).unwrap().finish()
+        Operator::new(services::Memory::default()).unwrap()
     }
 
     #[tokio::test]
