@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use log::{debug, info, warn};
 use opendal::Operator;
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use url::Url;
 use walkdir::WalkDir;
@@ -267,6 +268,10 @@ fn scan_markdown_file(
 /// Rewritten links (e.g. `https://cdn.example.com/imgs/a.png` with
 /// remote_root `imgs`) are recognized as references to objects this tool
 /// manages. Returns `None` for foreign URLs and non-URLs.
+///
+/// `url.path()` is the percent-encoded form (see [`build_public_url`]); it is
+/// decoded before the cloud path is extracted so the result matches the raw
+/// object keys used for uploads, listings and the diff.
 fn managed_cloud_path(dest: &str, domain: &Url, remote_root: &str) -> Option<String> {
     let url = Url::parse(dest).ok()?;
     // Match host and port strictly. Comparing `domain()` alone would accept
@@ -281,7 +286,7 @@ fn managed_cloud_path(dest: &str, domain: &Url, remote_root: &str) -> Option<Str
         return None;
     }
     let root = remote_root.trim_matches('/');
-    let path = url.path();
+    let path = percent_decode(url.path());
     if root.is_empty() {
         return Some(path.trim_start_matches('/').to_string());
     }
@@ -342,10 +347,30 @@ fn resolve_image_path(dest: &str, md_file: &Path) -> Option<PathBuf> {
     canonical.is_file().then_some(canonical)
 }
 
+/// Characters percent-encoded in the path of generated public URLs.
+///
+/// The set covers control characters, spaces, non-ASCII bytes (always encoded
+/// by `utf8_percent_encode`), characters that terminate a URL path (`#`, `?`)
+/// or are unsafe in markdown inline link destinations (`<`, `>`, `"`), and `%`
+/// itself so percent-decoding the URL always yields the original cloud path,
+/// even for file names that already contain `%xx`-looking sequences. `/` is
+/// deliberately kept so the cloud path hierarchy stays readable.
+const PUBLIC_URL_PATH: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'#')
+    .add(b'?');
+
 /// Builds the public URL for a cloud path.
 ///
 /// `remote_root` may be `/`, empty or a plain directory name; the result
-/// never contains double slashes.
+/// never contains double slashes. The cloud path is percent-encoded (see
+/// [`PUBLIC_URL_PATH`]) so the URL stays valid per RFC 3986 and usable in
+/// markdown inline links even for non-ASCII names, spaces and reserved
+/// characters; the cloud object key itself remains the raw, unencoded path.
 pub fn build_public_url(domain: &Url, remote_root: &str, cloud_path: &str) -> Result<Url> {
     let root = remote_root.trim_matches('/');
     let domain_str = domain.as_str().trim_end_matches('/');
@@ -354,7 +379,8 @@ pub fn build_public_url(domain: &Url, remote_root: &str, cloud_path: &str) -> Re
     } else {
         format!("{}/{}", domain_str, root)
     };
-    let url = format!("{}/{}", base, cloud_path.trim_start_matches('/'));
+    let encoded = utf8_percent_encode(cloud_path.trim_start_matches('/'), PUBLIC_URL_PATH);
+    let url = format!("{}/{}", base, encoded);
     Url::parse(&url).with_context(|| format!("Failed to build public URL from {}", url))
 }
 
@@ -596,6 +622,54 @@ mod tests {
             managed_cloud_path("https://1.2.3.4/imgs/a.png", &ip_domain, "imgs"),
             Some("a.png".to_string())
         );
+    }
+
+    #[test]
+    fn build_public_url_percent_encodes_unsafe_path_characters() {
+        let domain = Url::parse("https://cdn.example.com").unwrap();
+
+        // Non-ASCII and spaces are encoded; `/` separators are preserved.
+        let url = build_public_url(&domain, "/", "图片 目录/图.png").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://cdn.example.com/%E5%9B%BE%E7%89%87%20%E7%9B%AE%E5%BD%95/%E5%9B%BE.png"
+        );
+
+        let url = build_public_url(&domain, "imgs", "my image.png").unwrap();
+        assert_eq!(url.as_str(), "https://cdn.example.com/imgs/my%20image.png");
+
+        // Characters that terminate a URL path or break inline links are
+        // encoded, and `/` between path segments is kept as-is.
+        let url = build_public_url(&domain, "/", "sub/a<b>c\"d#e?f.png").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://cdn.example.com/sub/a%3Cb%3Ec%22d%23e%3Ff.png"
+        );
+
+        // `%` itself is encoded so decoding round-trips to the original name.
+        let url = build_public_url(&domain, "/", "dir/100%.png").unwrap();
+        assert_eq!(url.as_str(), "https://cdn.example.com/dir/100%25.png");
+    }
+
+    #[test]
+    fn managed_cloud_path_decodes_percent_encoded_urls_back_to_keys() {
+        let domain = Url::parse("https://cdn.example.com").unwrap();
+
+        for (root, cloud_path) in [
+            ("/", "图片 目录/图.png"),
+            ("imgs", "my image.png"),
+            ("/", "sub/a<b>c\"d#e?f.png"),
+            ("imgs", "dir/100%.png"),
+        ] {
+            let url = build_public_url(&domain, root, cloud_path).unwrap();
+            assert_eq!(
+                managed_cloud_path(url.as_str(), &domain, root),
+                Some(cloud_path.to_string()),
+                "round-trip failed for {} under root {}",
+                cloud_path,
+                root
+            );
+        }
     }
 
     #[test]
@@ -873,6 +947,65 @@ mod pipeline_e2e_tests {
             .filter(|e| e.metadata().mode() != opendal::EntryMode::DIR)
             .count();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn space_in_file_name_is_encoded_and_survives_rerun() {
+        // Regression: a cloud path with a space used to be written verbatim
+        // into the markdown, which breaks the CommonMark inline link, and the
+        // next run could not map the URL back to the object key, deleting the
+        // remote object. The rewritten URL must be percent-encoded while the
+        // object key keeps the raw file name.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("my image.png"), b"png-bytes").unwrap();
+        let md = dir.path().join("post.md");
+        std::fs::write(&md, "![a](<my image.png>)\n").unwrap();
+
+        let op = memory_op();
+        run_once(&op, dir.path()).await.unwrap();
+
+        // The link is now a valid URL with no bare space.
+        let rewritten = "![a](https://cdn.example.com/my%20image.png)\n";
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), rewritten);
+
+        // The object key is the raw (unencoded) file name.
+        assert_eq!(
+            op.read("my image.png").await.unwrap().to_vec(),
+            b"png-bytes"
+        );
+
+        // Second run: the rewritten link is still recognized as managed, so
+        // the object is not deleted and the markdown is left untouched.
+        run_once(&op, dir.path()).await.unwrap();
+        assert!(op.stat("my image.png").await.is_ok());
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), rewritten);
+    }
+
+    #[tokio::test]
+    async fn non_ascii_file_name_is_encoded_and_survives_rerun() {
+        // Same regression for non-ASCII (Chinese) names with a space in the
+        // directory: RFC 3986 requires percent-encoding, and decoding the URL
+        // back must be symmetric with the raw object key.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("图片 目录")).unwrap();
+        std::fs::write(dir.path().join("图片 目录/图.png"), b"png-bytes").unwrap();
+        let md = dir.path().join("post.md");
+        std::fs::write(&md, "![图](<图片 目录/图.png>)\n").unwrap();
+
+        let op = memory_op();
+        run_once(&op, dir.path()).await.unwrap();
+
+        let rewritten =
+            "![图](https://cdn.example.com/%E5%9B%BE%E7%89%87%20%E7%9B%AE%E5%BD%95/%E5%9B%BE.png)\n";
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), rewritten);
+        assert_eq!(
+            op.read("图片 目录/图.png").await.unwrap().to_vec(),
+            b"png-bytes"
+        );
+
+        run_once(&op, dir.path()).await.unwrap();
+        assert!(op.stat("图片 目录/图.png").await.is_ok());
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), rewritten);
     }
 
     #[tokio::test]
