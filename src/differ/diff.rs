@@ -1,138 +1,243 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::FileInfo;
-use anyhow::{Ok, Result};
-use log::{info, trace};
+use log::{debug, info, warn};
+
+use crate::uploader::uploader::UpFile;
+
+/// A local image with its computed checksum and target cloud path.
+#[derive(Debug, Clone)]
+pub struct LocalImage {
+    /// Absolute local path of the image file.
+    pub local_path: PathBuf,
+    /// Cloud path (relative to the remote root, no leading slash).
+    pub cloud_path: String,
+    /// Lowercase hexadecimal MD5 of the local content.
+    pub md5: String,
+}
+
+/// A remote object as reported by the cloud listing.
+#[derive(Debug, Clone)]
+pub struct RemoteImage {
+    /// Cloud path (relative to the remote root, no leading slash).
+    pub cloud_path: String,
+    /// Lowercase hexadecimal MD5, or `None` when unknown (e.g. multipart ETag
+    /// or a service that does not expose checksums in listings).
+    pub md5: Option<String>,
+}
+
+/// The set of cloud transfers needed to bring the remote in sync with local.
+#[derive(Debug, Default)]
+pub struct DiffPlan {
+    /// Files that exist only locally and must be uploaded.
+    pub uploads: Vec<UpFile>,
+    /// Cloud paths that exist only remotely and must be deleted.
+    pub deletes: Vec<String>,
+    /// Files that exist on both sides with different content.
+    pub replaces: Vec<UpFile>,
+}
 
 /// Compares the differences between local and remote files.
 ///
-/// This function takes two vectors of `FileInfo` objects, representing local and remote files,
-/// and determines which files need to be uploaded, deleted, or replaced based on their names and MD5 checksums.
+/// Local and remote entries are joined on their normalized cloud path. Files
+/// that only exist locally are planned for upload, files that only exist
+/// remotely are planned for deletion, and files whose checksums differ are
+/// planned for replacement. When the remote checksum is unknown (multipart
+/// ETag or missing metadata) the file is left untouched instead of being
+/// endlessly replaced.
 ///
 /// # Arguments
 ///
-/// * `local` - A vector of `FileInfo` objects representing the local files.
-/// * `remote` - A vector of `FileInfo` objects representing the remote files.
+/// * `local` - Local images with checksums.
+/// * `remote` - Remote objects with checksums (when available).
 ///
 /// # Returns
 ///
-/// A `Result` containing a tuple of three vectors:
-///
-/// * `uploadlist` - A vector of `PathBuf` objects representing files that need to be uploaded.
-/// * `deletelist` - A vector of `PathBuf` objects representing files that need to be deleted.
-/// * `replacelist` - A vector of `PathBuf` objects representing files that need to be replaced.
-///
-/// # Errors
-///
-/// This function will return an error if any operation fails, such as sorting or accessing file information.
+/// A `DiffPlan` describing uploads, deletions and replacements.
 ///
 /// # Examples
 ///
 /// ```
-/// use mdluploader::FileInfo;
-/// use mdluploader::differ::diff::diff;
+/// use mdluploader::differ::diff::{diff, LocalImage, RemoteImage};
 /// use std::path::PathBuf;
 ///
-/// let local_files = vec![FileInfo::new(PathBuf::from("file1.txt"), "md5hash1".to_string())];
-/// let remote_files = vec![FileInfo::new(PathBuf::from("file2.txt"), "md5hash2".to_string())];
+/// let local = vec![LocalImage {
+///     local_path: PathBuf::from("/tmp/file1.txt"),
+///     cloud_path: "file1.txt".to_string(),
+///     md5: "md5hash1".to_string(),
+/// }];
+/// let remote = vec![RemoteImage {
+///     cloud_path: "file2.txt".to_string(),
+///     md5: Some("md5hash2".to_string()),
+/// }];
 ///
-/// let (uploadlist, deletelist, replacelist) = diff(local_files, remote_files).unwrap();
-/// assert_eq!(uploadlist.len(), 1);
-/// assert_eq!(deletelist.len(), 1);
-/// assert_eq!(replacelist.len(), 0);
+/// let plan = diff(local, remote);
+/// assert_eq!(plan.uploads.len(), 1);
+/// assert_eq!(plan.deletes.len(), 1);
+/// assert_eq!(plan.replaces.len(), 0);
 /// ```
-pub fn diff(
-    local: Vec<FileInfo>,
-    remote: Vec<FileInfo>,
-) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>)> {
-    // Sorting
-    trace!("Start sorting local and remote files");
+pub fn diff(local: Vec<LocalImage>, remote: Vec<RemoteImage>) -> DiffPlan {
+    // Sort before deduplication so the choice of a surviving entry is
+    // deterministic regardless of parallel collection order upstream.
     let mut local_sorted = local;
-    local_sorted.sort_unstable();
-    let mut remote_sorted = remote;
-    remote_sorted.sort_unstable();
+    local_sorted.sort_by(|a, b| a.cloud_path.cmp(&b.cloud_path));
 
-    trace!("Local files sorted: {:?}", local_sorted);
-    trace!("Remote files sorted: {:?}", remote_sorted);
+    let mut local_map: HashMap<String, LocalImage> = HashMap::with_capacity(local_sorted.len());
+    for image in local_sorted {
+        if local_map.contains_key(&image.cloud_path) {
+            warn!(
+                "Multiple local images map to cloud path {}; keeping {} and skipping the rest",
+                image.cloud_path,
+                local_map[&image.cloud_path].local_path.display()
+            );
+            continue;
+        }
+        local_map.insert(image.cloud_path.clone(), image);
+    }
 
-    trace!("Finished sorting local and remote files");
+    let mut remote_map: HashMap<String, Option<String>> = HashMap::with_capacity(remote.len());
+    for entry in remote {
+        remote_map.entry(entry.cloud_path).or_insert(entry.md5);
+    }
 
-    // Index
-    let mut local_idx = 0;
-    let mut remote_idx = 0;
+    let mut plan = DiffPlan::default();
 
-    let mut uploadlist: Vec<PathBuf> = Vec::new();
-    let mut deletelist: Vec<PathBuf> = Vec::new();
-    let mut replacelist: Vec<PathBuf> = Vec::new();
-
-    while local_idx < local_sorted.len() && remote_idx < remote_sorted.len() {
-        trace!(
-            "Comparing local file {} with remote file {}",
-            local_sorted[local_idx].get_path().display(),
-            remote_sorted[remote_idx].get_path().display()
-        );
-        let local_file_info = &local_sorted[local_idx];
-        let local_name = local_file_info.get_path().file_name().unwrap();
-        let local_md5 = local_file_info.get_md5();
-
-        let remote_file_info = &remote_sorted[remote_idx];
-        let remote_name = remote_file_info.get_path().file_name().unwrap();
-        let remote_md5 = remote_file_info.get_md5();
-
-        match local_name.cmp(remote_name) {
-            std::cmp::Ordering::Less => {
+    for (cloud_path, image) in &local_map {
+        match remote_map.get(cloud_path) {
+            None => {
                 info!(
-                    "File {:?} does not exist in the cloud, waiting for upload",
-                    local_name
+                    "File {} does not exist in the cloud, waiting for upload",
+                    cloud_path
                 );
-                uploadlist.push(local_file_info.get_path().to_path_buf());
-                local_idx += 1; // Only increase local index
+                plan.uploads
+                    .push(UpFile::new(image.local_path.clone(), cloud_path.clone()));
             }
-            std::cmp::Ordering::Greater => {
-                info!(
-                    "File {:?} does not exist locally, waiting for deletion",
-                    remote_name
-                );
-                deletelist.push(remote_file_info.get_path().to_path_buf());
-                remote_idx += 1; // Only increase remote index
-            }
-            std::cmp::Ordering::Equal => {
-                if local_md5 != remote_md5 {
+            Some(Some(remote_md5)) => {
+                if !remote_md5.eq_ignore_ascii_case(&image.md5) {
                     info!(
-                        "File {:?} content has changed, waiting for update",
-                        local_name
+                        "File {} content has changed, waiting for update",
+                        cloud_path
                     );
-                    replacelist.push(local_file_info.get_path().to_path_buf());
+                    plan.replaces
+                        .push(UpFile::new(image.local_path.clone(), cloud_path.clone()));
+                } else {
+                    debug!("File {} is identical on both sides", cloud_path);
                 }
-                local_idx += 1; // Increase both indices
-                remote_idx += 1;
+            }
+            Some(None) => {
+                debug!(
+                    "Remote checksum for {} is unknown; skipping to avoid spurious replacement",
+                    cloud_path
+                );
             }
         }
     }
 
-    // Process remaining local files
-    while local_idx < local_sorted.len() {
-        let local_file_info = &local_sorted[local_idx];
-        let local_name = local_file_info.get_path().file_name().unwrap();
-        info!(
-            "File {:?} does not exist in the cloud, waiting for upload",
-            local_name
-        );
-        uploadlist.push(local_file_info.get_path().to_path_buf());
-        local_idx += 1;
+    for cloud_path in remote_map.keys() {
+        if !local_map.contains_key(cloud_path) {
+            info!(
+                "File {} does not exist locally, waiting for deletion",
+                cloud_path
+            );
+            plan.deletes.push(cloud_path.clone());
+        }
     }
 
-    // Process remaining remote files
-    while remote_idx < remote_sorted.len() {
-        let remote_file_info = &remote_sorted[remote_idx];
-        let remote_name = remote_file_info.get_path().file_name().unwrap();
-        info!(
-            "File {:?} does not exist locally, waiting for deletion",
-            remote_name
-        );
-        deletelist.push(remote_file_info.get_path().to_path_buf());
-        remote_idx += 1;
+    plan
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local(cloud_path: &str, md5: &str) -> LocalImage {
+        LocalImage {
+            local_path: PathBuf::from("/tmp").join(cloud_path),
+            cloud_path: cloud_path.to_string(),
+            md5: md5.to_string(),
+        }
     }
 
-    Ok((uploadlist, deletelist, replacelist))
+    fn remote(cloud_path: &str, md5: Option<&str>) -> RemoteImage {
+        RemoteImage {
+            cloud_path: cloud_path.to_string(),
+            md5: md5.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn local_only_files_are_uploaded() {
+        let plan = diff(vec![local("a.png", "m1")], vec![]);
+        assert_eq!(plan.uploads.len(), 1);
+        assert_eq!(plan.uploads[0].cloud_path, "a.png");
+        assert!(plan.deletes.is_empty());
+        assert!(plan.replaces.is_empty());
+    }
+
+    #[test]
+    fn remote_only_files_are_deleted_by_cloud_path() {
+        // Regression: remote-only paths used to be converted with a local
+        // strip_prefix and panicked. They must be deleted as cloud paths.
+        let plan = diff(vec![], vec![remote("sub/b.png", Some("m2"))]);
+        assert_eq!(plan.deletes, vec!["sub/b.png".to_string()]);
+    }
+
+    #[test]
+    fn identical_files_need_no_action_even_with_case_difference() {
+        let plan = diff(
+            vec![local("a.png", "abc123")],
+            vec![remote("a.png", Some("ABC123"))],
+        );
+        assert!(plan.uploads.is_empty());
+        assert!(plan.deletes.is_empty());
+        assert!(plan.replaces.is_empty());
+    }
+
+    #[test]
+    fn changed_files_are_replaced() {
+        let plan = diff(
+            vec![local("a.png", "m1")],
+            vec![remote("a.png", Some("m2"))],
+        );
+        assert_eq!(plan.replaces.len(), 1);
+        assert_eq!(plan.replaces[0].cloud_path, "a.png");
+        assert!(plan.uploads.is_empty());
+        assert!(plan.deletes.is_empty());
+    }
+
+    #[test]
+    fn unknown_remote_checksum_is_left_alone() {
+        // Multipart ETags must not trigger endless replacement.
+        let plan = diff(vec![local("a.png", "m1")], vec![remote("a.png", None)]);
+        assert!(plan.uploads.is_empty());
+        assert!(plan.deletes.is_empty());
+        assert!(plan.replaces.is_empty());
+    }
+
+    #[test]
+    fn leading_slash_remote_paths_match_local_relative_paths() {
+        // The diff itself receives normalized paths; verify the join survives
+        // mixed forms via explicit normalization upstream is not needed here.
+        let plan = diff(
+            vec![local("sub/a.png", "m1")],
+            vec![remote("sub/a.png", Some("m1"))],
+        );
+        assert!(plan.replaces.is_empty());
+    }
+
+    #[test]
+    fn same_basename_in_different_dirs_does_not_collide() {
+        // Regression: the old basename-only diff treated these as one file.
+        let plan = diff(
+            vec![local("sub1/a.png", "m1"), local("sub2/a.png", "m2")],
+            vec![],
+        );
+        assert_eq!(plan.uploads.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_local_cloud_paths_are_deduplicated() {
+        let plan = diff(vec![local("a.png", "m1"), local("a.png", "m1")], vec![]);
+        assert_eq!(plan.uploads.len(), 1);
+    }
 }

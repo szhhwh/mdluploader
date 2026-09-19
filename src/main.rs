@@ -1,14 +1,17 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use differ::diff;
+use differ::diff::{self, LocalImage, RemoteImage};
 use log::{debug, info, trace, warn};
-use mdluploader::{cli::Args, *};
+use mdluploader::{
+    cli, differ, get_file_md5, mdparser, normalize_cloud_path, read_file_list, remote_md5,
+    to_cloud_path, uploader,
+};
 use opendal::Operator;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
-use uploader::{s3::AwsS3, uploader::UpFile, uploader::Uploader};
+use uploader::{s3::AwsS3, uploader::Uploader};
 use url::Url;
 
 #[tokio::main]
@@ -19,7 +22,7 @@ async fn main() -> Result<()> {
     }
     env_logger::init();
 
-    let args = Args::parse();
+    let args = cli::Args::parse();
 
     info!("Welcome to Markdown Image Uploader!");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
@@ -72,6 +75,12 @@ async fn upload(
     info!("Get vaild domain: {}", domain);
 
     debug!("Source path: {:?}", md_src_path);
+    // Canonicalize the source path up front so every later path mapping
+    // (to_cloud_path) works on one canonical form.
+    let md_src_path = md_src_path
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize source path: {:?}", md_src_path))?;
+
     // Read all files and folders from the given path
     let files = read_file_list(&md_src_path, &depth)?;
     // Filter valid files
@@ -112,11 +121,15 @@ async fn upload(
         image_path_list.len()
     );
 
-    // Calculate MD5 values for local images
-    let local_img_list: Vec<FileInfo> = image_path_list
+    // Calculate MD5 values for local images and map them to cloud paths
+    let local_img_list: Vec<LocalImage> = image_path_list
         .par_iter()
         .filter_map(|img| match get_file_md5(img) {
-            Ok(md5) => Some(FileInfo::new(img.clone(), md5)),
+            Ok(md5) => Some(LocalImage {
+                local_path: img.clone(),
+                cloud_path: to_cloud_path(img, &md_src_path),
+                md5,
+            }),
             Err(e) => {
                 log::error!("Failed to get MD5 for {:?}: {}", img, e);
                 None
@@ -130,71 +143,49 @@ async fn upload(
     // Fetch file list from cloud
     trace!("Starting to list cloud files...");
     let list = uploader.list_cloud("/", true).await?;
-    let remote_img_list: Vec<FileInfo> = list
-        .par_iter()
-        .map(|entry| {
-            FileInfo::new(
-                PathBuf::from(entry.path().to_string()),
-                entry.metadata().content_md5().unwrap().to_string(),
-            )
+    let remote_img_list: Vec<RemoteImage> = list
+        .iter()
+        .map(|entry| RemoteImage {
+            cloud_path: normalize_cloud_path(entry.path()),
+            md5: entry.metadata().content_md5().and_then(remote_md5),
         })
         .collect();
     trace!("Finished list cloud files.");
 
     // Compare cloud files and local files to find files that need to be uploaded
-    let (uploadlist, deletelist, replacelist) = diff::diff(local_img_list, remote_img_list)?;
+    let plan = diff::diff(local_img_list, remote_img_list);
 
     // Output difference lists
-    info!("{} files need to be uploaded.", uploadlist.len());
-    for item in &uploadlist {
-        debug!("File to upload: {:?}", item);
+    info!("{} files need to be uploaded.", plan.uploads.len());
+    for item in &plan.uploads {
+        debug!("File to upload: {}", item.cloud_path);
     }
-    info!("{} files need to be deleted.", deletelist.len());
-    for item in &deletelist {
-        debug!("File to delete: {:?}", item);
+    info!("{} files need to be deleted.", plan.deletes.len());
+    for item in &plan.deletes {
+        debug!("File to delete: {}", item);
     }
-    info!("{} files need to be replaced.", replacelist.len());
-    for item in &replacelist {
-        debug!("File to replace: {:?}", item);
+    info!("{} files need to be replaced.", plan.replaces.len());
+    for item in &plan.replaces {
+        debug!("File to replace: {}", item.cloud_path);
     }
-
-    // Convert all PathBuf to UpFile, which contains both local path and cloud path
-    let md_src_path = md_src_path // Ensure the source path is canonicalized
-        .canonicalize()
-        .with_context(|| format!("Failed to canonicalize source path: {:?}", md_src_path))?;
-
-    let uploadlist: Vec<UpFile> = uploadlist
-        .par_iter()
-        .map(|file| UpFile::from_pathbuf(file, &md_src_path).unwrap())
-        .collect();
-
-    let deletelist: Vec<String> = deletelist
-        .par_iter()
-        .map(|file| UpFile::from_pathbuf(file, &md_src_path).unwrap().cloud_path)
-        .collect();
-
-    let replacelist: Vec<UpFile> = replacelist
-        .par_iter()
-        .map(|file| UpFile::from_pathbuf(file, &md_src_path).unwrap())
-        .collect();
 
     info!("Starting to upload files...");
     // Process files that need to be uploaded
-    if !uploadlist.is_empty() {
+    if !plan.uploads.is_empty() {
         info!("Starting to upload files...");
-        uploader.upload_files(uploadlist).await?;
+        uploader.upload_files(plan.uploads).await?;
     }
 
     // Process files that need to be deleted
-    if !deletelist.is_empty() {
+    if !plan.deletes.is_empty() {
         info!("Starting to delete files...");
-        uploader.delete_files(deletelist).await?;
+        uploader.delete_files(plan.deletes).await?;
     }
 
     // Process files that need to be replaced
-    if !replacelist.is_empty() {
+    if !plan.replaces.is_empty() {
         info!("Starting to replace files...");
-        uploader.upload_files(replacelist).await?;
+        uploader.upload_files(plan.replaces).await?;
     }
 
     // Process link replacement in Markdown files

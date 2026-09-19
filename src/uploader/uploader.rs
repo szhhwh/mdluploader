@@ -23,29 +23,6 @@ impl UpFile {
             cloud_path,
         }
     }
-
-    /// Creates a new `UpFile` by resolving `local_path` relative to the
-    /// markdown source root `src`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `local_path` is not under `src`.
-    pub fn from_pathbuf(local_path: &PathBuf, src: &PathBuf) -> Result<Self> {
-        let relative_path = local_path.strip_prefix(src).with_context(|| {
-            format!(
-                "Path {} is not under base path {}",
-                local_path.display(),
-                src.display()
-            )
-        })?;
-
-        let cloud_path = relative_path.to_string_lossy().to_string();
-
-        Ok(Self {
-            local_path: local_path.clone(),
-            cloud_path,
-        })
-    }
 }
 
 /// Represents an uploader that interacts with a cloud storage system.
