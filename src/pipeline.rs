@@ -29,6 +29,10 @@ pub struct PipelineConfig {
     pub domain: String,
     /// Remote root prefix under which images are served (e.g. `imgs`).
     pub remote_root: String,
+    /// Only print the plan; do not transfer or rewrite anything.
+    pub dry_run: bool,
+    /// Override the concurrent-transfer limit; `None` uses the default.
+    pub concurrency: Option<usize>,
 }
 
 /// Result of scanning the local markdown tree.
@@ -87,7 +91,10 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
         })
         .collect();
 
-    let uploader = Uploader::new(op);
+    let uploader = match config.concurrency {
+        Some(limit) => Uploader::new(op).with_concurrency(limit),
+        None => Uploader::new(op),
+    };
 
     // Phase 3: list the remote once and diff. Some backends (fs, memory)
     // return directory entries in listings; only compare actual objects.
@@ -127,6 +134,28 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
     info!("{} files need to be uploaded.", plan.uploads.len());
     info!("{} files need to be deleted.", deletes.len());
     info!("{} files need to be replaced.", plan.replaces.len());
+
+    if config.dry_run {
+        for f in &plan.uploads {
+            info!(
+                "[dry-run] upload {} <- {}",
+                f.cloud_path,
+                f.local_path.display()
+            );
+        }
+        for d in &deletes {
+            info!("[dry-run] delete {}", d);
+        }
+        for f in &plan.replaces {
+            info!(
+                "[dry-run] replace {} <- {}",
+                f.cloud_path,
+                f.local_path.display()
+            );
+        }
+        info!("[dry-run] no changes applied.");
+        return Ok(());
+    }
 
     // Phase 4: transfer. Any failure aborts the run, so reaching phase 5
     // guarantees the final remote set below is accurate.
@@ -487,6 +516,8 @@ mod pipeline_e2e_tests {
                 depth: 10,
                 domain: "https://cdn.example.com".to_string(),
                 remote_root: "/".to_string(),
+                dry_run: false,
+                concurrency: None,
             },
         )
         .await
@@ -527,6 +558,36 @@ mod pipeline_e2e_tests {
         std::fs::write(&md, "No more images.\n").unwrap();
         run_once(&op, dir.path()).await.unwrap();
         assert!(op.stat("images/a.png").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dry_run_transfers_and_rewrites_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("images")).unwrap();
+        std::fs::write(dir.path().join("images/a.png"), b"png-bytes").unwrap();
+        let md = dir.path().join("post.md");
+        let original = "![a](images/a.png)\n";
+        std::fs::write(&md, original).unwrap();
+
+        let op = memory_op();
+        run(
+            op.clone(),
+            PipelineConfig {
+                src: dir.path().to_path_buf(),
+                depth: 10,
+                domain: "https://cdn.example.com".to_string(),
+                remote_root: "/".to_string(),
+                dry_run: true,
+                concurrency: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Nothing was transferred and the markdown was left untouched.
+        let entries = op.list_with("/").recursive(true).await.unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), original);
     }
 
     #[tokio::test]

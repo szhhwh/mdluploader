@@ -9,6 +9,16 @@ use md5::Digest;
 use std::io::Read;
 use std::path::Path;
 
+/// Default concurrency for parallel cloud transfers.
+///
+/// CPU count * 2 (transfers are I/O-bound), clamped to [4, 32].
+pub fn default_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get() * 2)
+        .unwrap_or(8)
+        .clamp(4, 32)
+}
+
 /// Computes the MD5 checksum of a file.
 ///
 /// The file is hashed in streaming fashion with a fixed-size buffer, so large

@@ -62,14 +62,7 @@ impl Uploader {
     /// cores, ensuring efficient utilization of system resources for
     /// I/O-bound tasks.
     fn default_concurrency() -> usize {
-        // Base concurrency limit: CPU cores * 2 (considering I/O-bound tasks)
-        let base_limit = num_cpus::get() * 2;
-
-        // Set a minimum and maximum value to prevent extreme cases
-        let min_limit = 4;
-        let max_limit = 32;
-
-        base_limit.clamp(min_limit, max_limit)
+        crate::default_concurrency()
     }
 
     /// Lists files and directories in the cloud storage.

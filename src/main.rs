@@ -33,6 +33,8 @@ async fn main() -> Result<()> {
             endpoint,
             domain,
             remote_root,
+            dry_run,
+            concurrency,
         } => {
             let remote_root = remote_root.unwrap_or_else(|| "/".to_string());
             let op = AwsS3::new(bucket, ak, sk, region, endpoint, remote_root.clone()).build()?;
@@ -41,6 +43,8 @@ async fn main() -> Result<()> {
                 depth,
                 domain,
                 remote_root,
+                dry_run,
+                concurrency,
             };
             pipeline::run(op, config).await?;
         }
