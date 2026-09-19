@@ -56,6 +56,7 @@ mdluploader upload /path/to/markdown/folder \
 - `-d, --domain`: S3自定义访问域名（必需）
 - `--depth`: 扫描的最大目录深度（默认值：10）
 - `--dry-run`: 只打印将要上传/删除/替换的文件，不执行任何实际操作
+- `--cache-control`: 上传对象的 Cache-Control 响应头（默认值：`public, max-age=86400`；传空字符串 `""` 表示不设置该头。上传时会按文件扩展名自动设置 Content-Type，如 png → `image/png`，未知扩展回退 `application/octet-stream`）
 - `--concurrency`: 并发传输数上限（默认按 CPU 数自动计算，限制在 4..=32）
 
 示例：

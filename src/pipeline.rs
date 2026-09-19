@@ -31,6 +31,9 @@ pub struct PipelineConfig {
     pub remote_root: String,
     /// Only print the plan; do not transfer or rewrite anything.
     pub dry_run: bool,
+    /// Cache-Control header set on uploaded objects; an empty string
+    /// leaves the header unset.
+    pub cache_control: String,
     /// Override the concurrent-transfer limit; `None` uses the default.
     pub concurrency: Option<usize>,
 }
@@ -94,7 +97,8 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
     let uploader = match config.concurrency {
         Some(limit) => Uploader::new(op).with_concurrency(limit),
         None => Uploader::new(op),
-    };
+    }
+    .with_cache_control(config.cache_control.clone());
 
     // Phase 3: list the remote once and diff. Some backends (fs, memory)
     // return directory entries in listings; only compare actual objects.
@@ -727,6 +731,7 @@ mod pipeline_e2e_tests {
                 domain: "https://cdn.example.com".to_string(),
                 remote_root: "/".to_string(),
                 dry_run: false,
+                cache_control: String::new(),
                 concurrency: None,
             },
         )
@@ -788,6 +793,7 @@ mod pipeline_e2e_tests {
                 domain: "https://cdn.example.com".to_string(),
                 remote_root: "/".to_string(),
                 dry_run: true,
+                cache_control: "public, max-age=86400".to_string(),
                 concurrency: Some(2),
             },
         )

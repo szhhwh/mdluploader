@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
             domain,
             remote_root,
             dry_run,
+            cache_control,
             concurrency,
         } => {
             let remote_root = remote_root.unwrap_or_else(|| "/".to_string());
@@ -44,6 +45,7 @@ async fn main() -> Result<()> {
                 domain,
                 remote_root,
                 dry_run,
+                cache_control,
                 concurrency,
             };
             pipeline::run(op, config).await?;

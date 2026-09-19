@@ -45,6 +45,8 @@ pub struct Uploader {
     op: Operator,
     /// Maximum number of concurrent transfer tasks.
     concurrency: usize,
+    /// Cache-Control header set on uploaded objects; empty means unset.
+    cache_control: String,
 }
 
 impl Uploader {
@@ -57,12 +59,24 @@ impl Uploader {
         Self {
             op,
             concurrency: Self::default_concurrency(),
+            cache_control: String::new(),
         }
     }
 
     /// Overrides the concurrency limit used for parallel transfers.
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         self.concurrency = concurrency.max(1);
+        self
+    }
+
+    /// Overrides the Cache-Control header set on uploaded objects.
+    ///
+    /// An empty value (the default) leaves the header unset. The CLI
+    /// default stays moderate on purpose: images are replaced in place
+    /// by cloud path, so an aggressive policy (immutable, huge max-age)
+    /// would serve stale copies from CDN caches after a replacement.
+    pub fn with_cache_control(mut self, cache_control: String) -> Self {
+        self.cache_control = cache_control;
         self
     }
 
@@ -157,9 +171,20 @@ impl Uploader {
         let mut reader = fs::File::open(&file.local_path)
             .await
             .with_context(|| format!("Failed to read local file {}", file.local_path.display()))?;
-        let mut writer = self
+
+        // Without an explicit Content-Type S3 stores
+        // application/octet-stream, which makes browsers download images
+        // instead of displaying them.
+        let writer = self
             .op
-            .writer(&file.cloud_path)
+            .writer_with(&file.cloud_path)
+            .content_type(crate::guess_content_type(&file.local_path));
+        let writer = if self.cache_control.is_empty() {
+            writer
+        } else {
+            writer.cache_control(&self.cache_control)
+        };
+        let mut writer = writer
             .await
             .with_context(|| format!("Failed to write cloud path {}", file.cloud_path))?;
 
@@ -320,6 +345,49 @@ mod tests {
 
         let got = op.read("pic.png").await.unwrap().to_vec();
         assert_eq!(got, b"png-bytes-123");
+    }
+
+    #[tokio::test]
+    async fn upload_files_sets_content_type_and_cache_control() {
+        // The memory backend stores both headers in the object metadata
+        // and exposes them through stat, so the round trip is observable.
+        // The mixed-case local extension also checks MIME inference at the
+        // real call site.
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("pic.PNG");
+        std::fs::write(&img, b"png-bytes").unwrap();
+
+        let op = memory_op();
+        let uploader =
+            Uploader::new(op.clone()).with_cache_control("public, max-age=86400".to_string());
+        uploader
+            .upload_files(vec![UpFile::new(img, "pic.png".to_string())])
+            .await
+            .unwrap();
+
+        let meta = op.stat("pic.png").await.unwrap();
+        assert_eq!(meta.content_type(), Some("image/png"));
+        assert_eq!(meta.cache_control(), Some("public, max-age=86400"));
+    }
+
+    #[tokio::test]
+    async fn upload_files_omits_cache_control_when_unset() {
+        // Default configuration: content type still set, cache control
+        // header left absent.
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("photo.jpeg");
+        std::fs::write(&img, b"jpeg-bytes").unwrap();
+
+        let op = memory_op();
+        let uploader = Uploader::new(op.clone());
+        uploader
+            .upload_files(vec![UpFile::new(img, "photo.jpeg".to_string())])
+            .await
+            .unwrap();
+
+        let meta = op.stat("photo.jpeg").await.unwrap();
+        assert_eq!(meta.content_type(), Some("image/jpeg"));
+        assert!(meta.cache_control().is_none());
     }
 
     #[tokio::test]
