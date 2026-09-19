@@ -6,8 +6,57 @@ pub mod uploader;
 
 use anyhow::{Context, Result};
 use md5::Digest;
+use std::fmt;
 use std::io::Read;
+use std::ops::Deref;
 use std::path::Path;
+
+/// A normalized cloud object path (no leading slash), as constructed from a
+/// local image or a cloud listing.
+///
+/// Every [`CloudPath`] is canonicalized by [`CloudPath::new`], which trims any
+/// leading slashes. Storage services disagree on whether listed paths start
+/// with `/` (S3 does, the memory backend does not), and locally derived paths
+/// used to be normalized by call-site discipline only; the newtype moves that
+/// invariant to the type system so downstream code (diff, transfers, URL
+/// building) can never observe a non-normalized path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CloudPath(String);
+
+impl CloudPath {
+    /// Creates a cloud path, trimming any leading slashes so listings and
+    /// locally derived paths share one canonical form.
+    ///
+    /// ```
+    /// use mdluploader::CloudPath;
+    ///
+    /// assert_eq!(CloudPath::new("/sub/a.png").as_str(), "sub/a.png");
+    /// assert_eq!(CloudPath::new("sub/a.png").as_str(), "sub/a.png");
+    /// ```
+    pub fn new(path: impl Into<String>) -> Self {
+        let path = path.into();
+        Self(path.trim_start_matches('/').to_string())
+    }
+
+    /// Views the canonical path as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for CloudPath {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Display for CloudPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Default concurrency for parallel cloud transfers.
 ///
@@ -98,26 +147,18 @@ pub fn guess_content_type<P: AsRef<Path>>(path: P) -> &'static str {
 /// - `src_root` - Canonicalized markdown source root.
 ///
 /// # Return
-/// - Cloud path relative to the remote root, without a leading slash.
-pub fn to_cloud_path(local: &Path, src_root: &Path) -> String {
+/// - [`CloudPath`] relative to the remote root, normalized at construction.
+pub fn to_cloud_path(local: &Path, src_root: &Path) -> CloudPath {
     if let Ok(rel) = local.strip_prefix(src_root) {
-        let rel = rel.to_string_lossy();
-        return rel.trim_start_matches('/').to_string();
+        return CloudPath::new(rel.to_string_lossy());
     }
 
     // Outside the source tree: fall back to the bare file name.
-    local
+    let fallback = local
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| local.to_string_lossy().to_string())
-}
-
-/// Normalizes a cloud path reported by a storage service.
-///
-/// Some services (e.g. S3) list entries with a leading slash while others
-/// (e.g. the memory backend) do not; diffing requires one canonical form.
-pub fn normalize_cloud_path(path: &str) -> String {
-    path.trim_start_matches('/').to_string()
+        .unwrap_or_else(|| local.to_string_lossy().to_string());
+    CloudPath::new(fallback)
 }
 
 /// Normalizes the MD5 checksum reported by a storage service.
@@ -188,7 +229,7 @@ mod tests {
     #[test]
     fn to_cloud_path_keeps_relative_structure() {
         assert_eq!(
-            to_cloud_path(Path::new("/blog/posts/img/a.png"), Path::new("/blog")),
+            to_cloud_path(Path::new("/blog/posts/img/a.png"), Path::new("/blog")).as_str(),
             "posts/img/a.png"
         );
     }
@@ -198,7 +239,7 @@ mod tests {
         // Regression: images outside the source tree used to panic on
         // strip_prefix; they must map to a flat cloud path instead.
         assert_eq!(
-            to_cloud_path(Path::new("/pics/logo.png"), Path::new("/blog")),
+            to_cloud_path(Path::new("/pics/logo.png"), Path::new("/blog")).as_str(),
             "logo.png"
         );
     }
@@ -207,7 +248,35 @@ mod tests {
     fn to_cloud_path_accepts_root_equal_path() {
         // A file can never equal the source root, but the degenerate case
         // should not panic and should normalize to the empty cloud path.
-        assert_eq!(to_cloud_path(Path::new("/blog"), Path::new("/blog")), "");
+        assert_eq!(
+            to_cloud_path(Path::new("/blog"), Path::new("/blog")).as_str(),
+            ""
+        );
+    }
+
+    #[test]
+    fn cloud_path_trims_leading_slashes() {
+        // S3-style listings report a leading slash; the memory backend does
+        // not. Both forms must canonicalize to the same path.
+        assert_eq!(CloudPath::new("/sub/pic.png").as_str(), "sub/pic.png");
+        assert_eq!(CloudPath::new("sub/pic.png").as_str(), "sub/pic.png");
+        assert_eq!(CloudPath::new("//sub/pic.png").as_str(), "sub/pic.png");
+        assert_eq!(CloudPath::new("///").as_str(), "");
+    }
+
+    #[test]
+    fn cloud_path_accepts_and_keeps_empty_path() {
+        assert_eq!(CloudPath::new("").as_str(), "");
+        assert_eq!(CloudPath::new("/").as_str(), "");
+    }
+
+    #[test]
+    fn cloud_path_compares_and_displays_as_its_string() {
+        // Equality and ordering follow the canonical string, and Display
+        // renders it directly so log lines stay unchanged.
+        assert_eq!(CloudPath::new("a.png"), CloudPath::new("/a.png"));
+        assert!(CloudPath::new("a.png") < CloudPath::new("b.png"));
+        assert_eq!(CloudPath::new("a.png").to_string(), "a.png");
     }
 
     #[test]
@@ -258,13 +327,6 @@ mod tests {
             guess_content_type(Path::new("photo.png.exe")),
             "application/octet-stream"
         );
-    }
-
-    #[test]
-    fn normalize_cloud_path_strips_leading_slash() {
-        assert_eq!(normalize_cloud_path("/sub/pic.png"), "sub/pic.png");
-        assert_eq!(normalize_cloud_path("sub/pic.png"), "sub/pic.png");
-        assert_eq!(normalize_cloud_path("/"), "");
     }
 
     #[test]

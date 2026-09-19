@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 
+use crate::CloudPath;
+
 /// Chunk size used when streaming uploads: bytes read from disk and pushed to
 /// the cloud writer per iteration.
 ///
@@ -23,12 +25,12 @@ pub struct UpFile {
     /// The local file path to be uploaded.
     pub local_path: PathBuf,
     /// The destination path in the cloud storage.
-    pub cloud_path: String,
+    pub cloud_path: CloudPath,
 }
 
 impl UpFile {
     /// Creates a new `UpFile` from an explicit local/cloud path pair.
-    pub fn new(local_path: PathBuf, cloud_path: String) -> Self {
+    pub fn new(local_path: PathBuf, cloud_path: CloudPath) -> Self {
         Self {
             local_path,
             cloud_path,
@@ -215,12 +217,12 @@ impl Uploader {
     ///
     /// # Arguments
     ///
-    /// * `paths` - A vector of cloud paths (strings) to delete.
+    /// * `paths` - A vector of cloud paths to delete.
     ///
     /// # Returns
     ///
     /// A `Result` indicating success or failure.
-    pub async fn delete_files(&self, paths: Vec<String>) -> Result<()> {
+    pub async fn delete_files(&self, paths: Vec<CloudPath>) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -244,12 +246,12 @@ impl Uploader {
     ///
     /// # Arguments
     ///
-    /// * `path` - A string slice representing the cloud path.
+    /// * `path` - The cloud path of the object to delete.
     ///
     /// # Returns
     ///
     /// A `Result` indicating success or failure.
-    async fn delete_one(&self, path: &str) -> Result<()> {
+    async fn delete_one(&self, path: &CloudPath) -> Result<()> {
         debug!("Deleting file from cloud: {}", path);
 
         self.op
@@ -273,9 +275,9 @@ impl Uploader {
     /// # Returns
     ///
     /// A vector of `(name, error)` pairs for every job that failed.
-    async fn run_limited<I, Fut>(jobs: I, limit: usize) -> Vec<(String, anyhow::Error)>
+    async fn run_limited<I, Fut>(jobs: I, limit: usize) -> Vec<(CloudPath, anyhow::Error)>
     where
-        I: IntoIterator<Item = (String, Fut)>,
+        I: IntoIterator<Item = (CloudPath, Fut)>,
         Fut: Future<Output = Result<()>>,
     {
         futures::stream::iter(jobs)
@@ -293,7 +295,7 @@ impl Uploader {
     }
 
     /// Turns a list of per-file failures into a single aggregate error.
-    fn report_failures(action: &str, failures: Vec<(String, anyhow::Error)>) -> Result<()> {
+    fn report_failures(action: &str, failures: Vec<(CloudPath, anyhow::Error)>) -> Result<()> {
         if failures.is_empty() {
             return Ok(());
         }
@@ -328,7 +330,7 @@ mod tests {
         let op = memory_op();
         let uploader = Uploader::new(op.clone());
         uploader
-            .upload_files(vec![UpFile::new(img, "pic.png".to_string())])
+            .upload_files(vec![UpFile::new(img, CloudPath::new("pic.png"))])
             .await
             .unwrap();
 
@@ -350,7 +352,7 @@ mod tests {
         let uploader =
             Uploader::new(op.clone()).with_cache_control("public, max-age=86400".to_string());
         uploader
-            .upload_files(vec![UpFile::new(img, "pic.png".to_string())])
+            .upload_files(vec![UpFile::new(img, CloudPath::new("pic.png"))])
             .await
             .unwrap();
 
@@ -370,7 +372,7 @@ mod tests {
         let op = memory_op();
         let uploader = Uploader::new(op.clone());
         uploader
-            .upload_files(vec![UpFile::new(img, "photo.jpeg".to_string())])
+            .upload_files(vec![UpFile::new(img, CloudPath::new("photo.jpeg"))])
             .await
             .unwrap();
 
@@ -401,7 +403,7 @@ mod tests {
         let op = memory_op();
         let uploader = Uploader::new(op.clone());
         uploader
-            .upload_files(vec![UpFile::new(img, "big.bin".to_string())])
+            .upload_files(vec![UpFile::new(img, CloudPath::new("big.bin"))])
             .await
             .unwrap();
 
@@ -421,7 +423,7 @@ mod tests {
         let op = memory_op();
         let uploader = Uploader::new(op.clone());
         uploader
-            .upload_files(vec![UpFile::new(img, "empty.png".to_string())])
+            .upload_files(vec![UpFile::new(img, CloudPath::new("empty.png"))])
             .await
             .unwrap();
 
@@ -435,7 +437,7 @@ mod tests {
         let err = uploader
             .upload_files(vec![UpFile::new(
                 PathBuf::from("/nonexistent/x.png"),
-                "x.png".to_string(),
+                CloudPath::new("x.png"),
             )])
             .await
             .unwrap_err();
@@ -460,12 +462,12 @@ mod tests {
         let uploader = Uploader::new(op.clone());
         let err = uploader
             .upload_files(vec![
-                UpFile::new(a, "a.png".to_string()),
+                UpFile::new(a, CloudPath::new("a.png")),
                 UpFile::new(
                     PathBuf::from("/nonexistent/missing.png"),
-                    "missing.png".to_string(),
+                    CloudPath::new("missing.png"),
                 ),
-                UpFile::new(b, "b.png".to_string()),
+                UpFile::new(b, CloudPath::new("b.png")),
             ])
             .await
             .unwrap_err();
@@ -487,7 +489,7 @@ mod tests {
 
         let uploader = Uploader::new(op.clone());
         uploader
-            .delete_files(vec!["a.png".to_string(), "b.png".to_string()])
+            .delete_files(vec![CloudPath::new("a.png"), CloudPath::new("b.png")])
             .await
             .unwrap();
 

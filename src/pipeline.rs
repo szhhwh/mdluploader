@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 use crate::differ::{diff, LocalImage, RemoteImage};
 use crate::mdparser::{extract_image_dests, is_remote_url, percent_decode, replace_image_links};
 use crate::uploader::Uploader;
-use crate::{get_file_md5, normalize_cloud_path, remote_md5, to_cloud_path};
+use crate::{get_file_md5, remote_md5, to_cloud_path, CloudPath};
 
 /// Configuration for one pipeline run.
 #[derive(Debug, Clone)]
@@ -52,7 +52,7 @@ struct ScanResult {
     /// Cloud paths referenced through already-rewritten URLs on our own
     /// domain. These objects must not be deleted by the diff just because
     /// no local file references them anymore.
-    managed_remote: HashSet<String>,
+    managed_remote: HashSet<CloudPath>,
 }
 
 /// Per-file result of scanning one markdown file.
@@ -62,7 +62,7 @@ struct ScannedFile {
     images: Vec<PathBuf>,
     /// Cloud paths referenced through already-rewritten URLs on our own
     /// domain (see [`ScanResult::managed_remote`]).
-    managed: HashSet<String>,
+    managed: HashSet<CloudPath>,
 }
 
 /// Runs the full upload pipeline.
@@ -116,30 +116,30 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
 
     // Phase 3: list the remote once and diff. Some backends (fs, memory)
     // return directory entries in listings; only compare actual objects.
+    // One pass over the entries builds both the initial remote set and the
+    // remote images for the diff; `CloudPath::new` normalizes each listed
+    // path (some services report a leading slash) into the canonical form.
     let entries: Vec<opendal::Entry> = uploader
         .list_cloud("/", true)
         .await?
         .into_iter()
         .filter(|entry| entry.metadata().mode() != opendal::EntryMode::DIR)
         .collect();
-    let initial_remote: Vec<String> = entries
-        .iter()
-        .map(|entry| normalize_cloud_path(entry.path()))
-        .collect();
-    let remote_images: Vec<RemoteImage> = entries
-        .iter()
-        .map(|entry| RemoteImage {
-            cloud_path: normalize_cloud_path(entry.path()),
-            md5: entry.metadata().content_md5().and_then(remote_md5),
-        })
-        .collect();
+    let mut initial_remote: Vec<CloudPath> = Vec::with_capacity(entries.len());
+    let mut remote_images: Vec<RemoteImage> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let md5 = entry.metadata().content_md5().and_then(remote_md5);
+        let cloud_path = CloudPath::new(entry.path());
+        initial_remote.push(cloud_path.clone());
+        remote_images.push(RemoteImage { cloud_path, md5 });
+    }
 
     // The diff borrows the local images; the pipeline still owns them and
     // reuses the computed cloud paths for link rewriting in phase 5.
     let plan = diff(&local_images, remote_images);
     // Objects still referenced through rewritten URLs on our own domain are
     // managed; only delete remote objects nobody references anymore.
-    let deletes: Vec<String> = plan
+    let deletes: Vec<CloudPath> = plan
         .deletes
         .iter()
         .filter(|p| !scan.managed_remote.contains(*p))
@@ -181,7 +181,7 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
     // transfer either completes and matches the plan or aborts the run), so
     // it is derived up front from the single listing; afterwards every batch
     // is handed to the uploader by value.
-    let added: Vec<String> = plan
+    let added: Vec<CloudPath> = plan
         .uploads
         .iter()
         .chain(plan.replaces.iter())
@@ -279,7 +279,7 @@ fn scan_markdown_file(md_file: PathBuf, domain: &Url, remote_root: &str) -> (Pat
         .filter(|dest| !dest.is_empty() && !is_remote_url(dest))
         .filter_map(|dest| resolve_image_path(&percent_decode(dest), &md_file))
         .collect();
-    let managed: HashSet<String> = dests
+    let managed: HashSet<CloudPath> = dests
         .iter()
         .filter_map(|dest| managed_cloud_path(dest, domain, remote_root))
         .collect();
@@ -296,7 +296,7 @@ fn scan_markdown_file(md_file: PathBuf, domain: &Url, remote_root: &str) -> (Pat
 /// `url.path()` is the percent-encoded form (see [`build_public_url`]); it is
 /// decoded before the cloud path is extracted so the result matches the raw
 /// object keys used for uploads, listings and the diff.
-fn managed_cloud_path(dest: &str, domain: &Url, remote_root: &str) -> Option<String> {
+fn managed_cloud_path(dest: &str, domain: &Url, remote_root: &str) -> Option<CloudPath> {
     let url = Url::parse(dest).ok()?;
     // Match host and port strictly. Comparing `domain()` alone would accept
     // URLs served on a different port, and `domain()` is `None` for IP hosts,
@@ -312,11 +312,10 @@ fn managed_cloud_path(dest: &str, domain: &Url, remote_root: &str) -> Option<Str
     let root = remote_root.trim_matches('/');
     let path = percent_decode(url.path());
     if root.is_empty() {
-        return Some(path.trim_start_matches('/').to_string());
+        return Some(CloudPath::new(path));
     }
     let prefix = format!("/{}/", root);
-    path.strip_prefix(&prefix)
-        .map(|rest| rest.trim_start_matches('/').to_string())
+    path.strip_prefix(&prefix).map(CloudPath::new)
 }
 
 /// Collects markdown files under `root` up to `depth`.
@@ -395,7 +394,8 @@ const PUBLIC_URL_PATH: &AsciiSet = &CONTROLS
 /// [`PUBLIC_URL_PATH`]) so the URL stays valid per RFC 3986 and usable in
 /// markdown inline links even for non-ASCII names, spaces and reserved
 /// characters; the cloud object key itself remains the raw, unencoded path.
-pub fn build_public_url(domain: &Url, remote_root: &str, cloud_path: &str) -> Result<Url> {
+/// The path is already normalized by [`CloudPath::new`].
+pub fn build_public_url(domain: &Url, remote_root: &str, cloud_path: &CloudPath) -> Result<Url> {
     let root = remote_root.trim_matches('/');
     let domain_str = domain.as_str().trim_end_matches('/');
     let base = if root.is_empty() {
@@ -403,7 +403,7 @@ pub fn build_public_url(domain: &Url, remote_root: &str, cloud_path: &str) -> Re
     } else {
         format!("{}/{}", domain_str, root)
     };
-    let encoded = utf8_percent_encode(cloud_path.trim_start_matches('/'), PUBLIC_URL_PATH);
+    let encoded = utf8_percent_encode(cloud_path.as_str(), PUBLIC_URL_PATH);
     let url = format!("{}/{}", base, encoded);
     Url::parse(&url).with_context(|| format!("Failed to build public URL from {}", url))
 }
@@ -411,11 +411,11 @@ pub fn build_public_url(domain: &Url, remote_root: &str, cloud_path: &str) -> Re
 /// Computes the set of cloud paths present after a successful transfer:
 /// the initial listing minus deletions plus uploads/replacements.
 pub fn final_remote_set(
-    initial: Vec<String>,
-    deletes: &[String],
-    added: &[String],
-) -> HashSet<String> {
-    let deleted: HashSet<&String> = deletes.iter().collect();
+    initial: Vec<CloudPath>,
+    deletes: &[CloudPath],
+    added: &[CloudPath],
+) -> HashSet<CloudPath> {
+    let deleted: HashSet<&CloudPath> = deletes.iter().collect();
     initial
         .into_iter()
         .filter(|p| !deleted.contains(p))
@@ -589,16 +589,16 @@ mod tests {
     fn build_public_url_never_produces_double_slashes() {
         let domain = Url::parse("https://cdn.example.com").unwrap();
 
-        let url = build_public_url(&domain, "/", "sub/a.png").unwrap();
+        let url = build_public_url(&domain, "/", &CloudPath::new("sub/a.png")).unwrap();
         assert_eq!(url.as_str(), "https://cdn.example.com/sub/a.png");
 
-        let url = build_public_url(&domain, "", "a.png").unwrap();
+        let url = build_public_url(&domain, "", &CloudPath::new("a.png")).unwrap();
         assert_eq!(url.as_str(), "https://cdn.example.com/a.png");
 
-        let url = build_public_url(&domain, "imgs", "a.png").unwrap();
+        let url = build_public_url(&domain, "imgs", &CloudPath::new("a.png")).unwrap();
         assert_eq!(url.as_str(), "https://cdn.example.com/imgs/a.png");
 
-        let url = build_public_url(&domain, "/imgs/", "/a.png").unwrap();
+        let url = build_public_url(&domain, "/imgs/", &CloudPath::new("/a.png")).unwrap();
         assert_eq!(url.as_str(), "https://cdn.example.com/imgs/a.png");
     }
 
@@ -608,11 +608,11 @@ mod tests {
 
         assert_eq!(
             managed_cloud_path("https://cdn.example.com/images/a.png", &domain, "/"),
-            Some("images/a.png".to_string())
+            Some(CloudPath::new("images/a.png"))
         );
         assert_eq!(
             managed_cloud_path("https://cdn.example.com/imgs/a.png", &domain, "imgs"),
-            Some("a.png".to_string())
+            Some(CloudPath::new("a.png"))
         );
         assert_eq!(
             managed_cloud_path("https://other.example.com/imgs/a.png", &domain, "imgs"),
@@ -639,7 +639,7 @@ mod tests {
         // An explicit default port is the same URL as the omitted-port form.
         assert_eq!(
             managed_cloud_path("https://cdn.example.com:443/imgs/a.png", &domain, "imgs"),
-            Some("a.png".to_string())
+            Some(CloudPath::new("a.png"))
         );
 
         // A configured non-default port only matches that exact port.
@@ -650,7 +650,7 @@ mod tests {
         );
         assert_eq!(
             managed_cloud_path("https://cdn.example.com:8443/imgs/a.png", &ported, "imgs"),
-            Some("a.png".to_string())
+            Some(CloudPath::new("a.png"))
         );
 
         // IP hosts: `domain()` is `None` for both, so they must be told
@@ -662,7 +662,7 @@ mod tests {
         );
         assert_eq!(
             managed_cloud_path("https://1.2.3.4/imgs/a.png", &ip_domain, "imgs"),
-            Some("a.png".to_string())
+            Some(CloudPath::new("a.png"))
         );
     }
 
@@ -671,25 +671,25 @@ mod tests {
         let domain = Url::parse("https://cdn.example.com").unwrap();
 
         // Non-ASCII and spaces are encoded; `/` separators are preserved.
-        let url = build_public_url(&domain, "/", "图片 目录/图.png").unwrap();
+        let url = build_public_url(&domain, "/", &CloudPath::new("图片 目录/图.png")).unwrap();
         assert_eq!(
             url.as_str(),
             "https://cdn.example.com/%E5%9B%BE%E7%89%87%20%E7%9B%AE%E5%BD%95/%E5%9B%BE.png"
         );
 
-        let url = build_public_url(&domain, "imgs", "my image.png").unwrap();
+        let url = build_public_url(&domain, "imgs", &CloudPath::new("my image.png")).unwrap();
         assert_eq!(url.as_str(), "https://cdn.example.com/imgs/my%20image.png");
 
         // Characters that terminate a URL path or break inline links are
         // encoded, and `/` between path segments is kept as-is.
-        let url = build_public_url(&domain, "/", "sub/a<b>c\"d#e?f.png").unwrap();
+        let url = build_public_url(&domain, "/", &CloudPath::new("sub/a<b>c\"d#e?f.png")).unwrap();
         assert_eq!(
             url.as_str(),
             "https://cdn.example.com/sub/a%3Cb%3Ec%22d%23e%3Ff.png"
         );
 
         // `%` itself is encoded so decoding round-trips to the original name.
-        let url = build_public_url(&domain, "/", "dir/100%.png").unwrap();
+        let url = build_public_url(&domain, "/", &CloudPath::new("dir/100%.png")).unwrap();
         assert_eq!(url.as_str(), "https://cdn.example.com/dir/100%25.png");
     }
 
@@ -703,10 +703,10 @@ mod tests {
             ("/", "sub/a<b>c\"d#e?f.png"),
             ("imgs", "dir/100%.png"),
         ] {
-            let url = build_public_url(&domain, root, cloud_path).unwrap();
+            let url = build_public_url(&domain, root, &CloudPath::new(cloud_path)).unwrap();
             assert_eq!(
-                managed_cloud_path(url.as_str(), &domain, root),
-                Some(cloud_path.to_string()),
+                managed_cloud_path(url.as_str(), &domain, root).as_deref(),
+                Some(cloud_path),
                 "round-trip failed for {} under root {}",
                 cloud_path,
                 root
@@ -716,14 +716,14 @@ mod tests {
 
     #[test]
     fn final_remote_set_applies_deletes_and_additions() {
-        let initial = vec!["a.png".to_string(), "b.png".to_string()];
-        let deletes = vec!["a.png".to_string()];
-        let added = vec!["c.png".to_string()];
+        let initial = vec![CloudPath::new("a.png"), CloudPath::new("b.png")];
+        let deletes = vec![CloudPath::new("a.png")];
+        let added = vec![CloudPath::new("c.png")];
 
         let set = final_remote_set(initial, &deletes, &added);
-        assert!(!set.contains("a.png"));
-        assert!(set.contains("b.png"));
-        assert!(set.contains("c.png"));
+        assert!(!set.contains(&CloudPath::new("a.png")));
+        assert!(set.contains(&CloudPath::new("b.png")));
+        assert!(set.contains(&CloudPath::new("c.png")));
     }
 
     /// Builds a temp dir with `post.md` referencing a local image, plus the
@@ -941,7 +941,7 @@ mod pipeline_e2e_tests {
             .unwrap()
             .into_iter()
             .filter(|e| e.metadata().mode() != opendal::EntryMode::DIR)
-            .map(|e| normalize_cloud_path(e.path()))
+            .map(|e| CloudPath::new(e.path()).to_string())
             .collect();
         assert_eq!(entries, vec!["images/a.png".to_string()]);
 
