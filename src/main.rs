@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     );
 
     match args.command {
-        cli::Commands::Upload {
+        cli::Commands::Upload(cli::UploadArgs {
             path,
             depth,
             bucket,
@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
             dry_run,
             cache_control,
             concurrency,
-        } => {
+        }) => {
             let remote_root = remote_root.unwrap_or_else(|| "/".to_string());
             let op = AwsS3::new(bucket, ak, sk, region, endpoint, remote_root.clone()).build()?;
             let config = PipelineConfig {
