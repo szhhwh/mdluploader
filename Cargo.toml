@@ -8,18 +8,23 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.98"
-clap = { version = "4.5.37", features = ["derive"] }
+clap = { version = "4.5.37", features = ["derive", "env"] }
 env_logger = "0.11.8"
 futures = "0.3.31"
 log = "0.4.27"
 md-5 = "0.10.6"
+pulldown-cmark = { version = "0.13", default-features = false }
+percent-encoding = "2.3"
 opendal = { version = "0.53.1", features = ["services-s3"] }
 rayon = "1.10.0"
 tokio = { version = "1.45.0", features = ["full"] }
 walkdir = "2.5.0"
-num_cpus = "1.16"
 clap_complete = "4.5.50"
 url = "2.5.4"
+
+[dev-dependencies]
+tempfile = "3"
+opendal = { version = "0.53.1", features = ["services-memory"] }
 
 [build-dependencies]
 vergen = { version = "9.0.0", features = ["build"] }

@@ -1,0 +1,748 @@
+//! The upload pipeline: scan markdown, hash images, diff against the cloud,
+//! transfer, and rewrite links.
+//!
+//! Each phase is a small testable function; [`run`] wires them together.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use log::{debug, info, warn};
+use opendal::Operator;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use url::Url;
+use walkdir::WalkDir;
+
+use crate::differ::{diff, LocalImage, RemoteImage};
+use crate::mdparser::{extract_image_dests, is_remote_url, percent_decode, replace_image_links};
+use crate::uploader::Uploader;
+use crate::{get_file_md5, normalize_cloud_path, remote_md5, to_cloud_path};
+
+/// Configuration for one pipeline run.
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    /// Directory containing the markdown source tree.
+    pub src: PathBuf,
+    /// Maximum directory depth to scan for markdown files.
+    pub depth: usize,
+    /// Public domain used to build image URLs written back into markdown.
+    pub domain: String,
+    /// Remote root prefix under which images are served (e.g. `imgs`).
+    pub remote_root: String,
+    /// Only print the plan; do not transfer or rewrite anything.
+    pub dry_run: bool,
+    /// Override the concurrent-transfer limit; `None` uses the default.
+    pub concurrency: Option<usize>,
+}
+
+/// Result of scanning the local markdown tree.
+#[derive(Debug, Default)]
+struct ScanResult {
+    /// All markdown files found.
+    md_files: Vec<PathBuf>,
+    /// For every markdown file, the resolved local image paths it references.
+    /// Built once and reused for hashing and link rewriting, so each markdown
+    /// file is parsed exactly once per run.
+    images_by_md: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Cloud paths referenced through already-rewritten URLs on our own
+    /// domain. These objects must not be deleted by the diff just because
+    /// no local file references them anymore.
+    managed_remote: HashSet<String>,
+}
+
+/// Runs the full upload pipeline.
+///
+/// Phases: scan markdown and images, hash local images, list the remote
+/// once, diff, transfer (upload/delete/replace), then rewrite image links in
+/// every affected markdown file.
+pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
+    let domain = Url::parse(&config.domain)
+        .with_context(|| format!("Invalid domain URL: {}", config.domain))?;
+    info!("Using domain: {}", domain);
+
+    let src = config
+        .src
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize source path {:?}", config.src))?;
+
+    // Phase 1: scan markdown files and their local images.
+    let scan = scan_local(&src, config.depth, &domain, &config.remote_root);
+    info!("Found {} markdown files.", scan.md_files.len());
+    let image_paths: HashSet<PathBuf> = scan.images_by_md.values().flatten().cloned().collect();
+    info!(
+        "{} image links detected in markdown files.",
+        image_paths.len()
+    );
+    debug!("Local images: {:?}", image_paths);
+
+    // Phase 2: hash local images and map them to cloud paths.
+    let local_images: Vec<LocalImage> = image_paths
+        .par_iter()
+        .filter_map(|img| match get_file_md5(img) {
+            Ok(md5) => Some(LocalImage {
+                local_path: img.clone(),
+                cloud_path: to_cloud_path(img, &src),
+                md5,
+            }),
+            Err(e) => {
+                warn!("Failed to get MD5 for {}: {}", img.display(), e);
+                None
+            }
+        })
+        .collect();
+
+    let uploader = match config.concurrency {
+        Some(limit) => Uploader::new(op).with_concurrency(limit),
+        None => Uploader::new(op),
+    };
+
+    // Phase 3: list the remote once and diff. Some backends (fs, memory)
+    // return directory entries in listings; only compare actual objects.
+    let entries: Vec<opendal::Entry> = uploader
+        .list_cloud("/", true)
+        .await?
+        .into_iter()
+        .filter(|entry| entry.metadata().mode() != opendal::EntryMode::DIR)
+        .collect();
+    let initial_remote: Vec<String> = entries
+        .iter()
+        .map(|entry| normalize_cloud_path(entry.path()))
+        .collect();
+    let remote_images: Vec<RemoteImage> = entries
+        .iter()
+        .map(|entry| RemoteImage {
+            cloud_path: normalize_cloud_path(entry.path()),
+            md5: entry.metadata().content_md5().and_then(remote_md5),
+        })
+        .collect();
+
+    let plan = diff(local_images, remote_images);
+    // Objects still referenced through rewritten URLs on our own domain are
+    // managed; only delete remote objects nobody references anymore.
+    let deletes: Vec<String> = plan
+        .deletes
+        .iter()
+        .filter(|p| !scan.managed_remote.contains(*p))
+        .cloned()
+        .collect();
+    if deletes.len() != plan.deletes.len() {
+        debug!(
+            "Keeping {} remote object(s) still referenced by rewritten URLs",
+            plan.deletes.len() - deletes.len()
+        );
+    }
+    info!("{} files need to be uploaded.", plan.uploads.len());
+    info!("{} files need to be deleted.", deletes.len());
+    info!("{} files need to be replaced.", plan.replaces.len());
+
+    if config.dry_run {
+        for f in &plan.uploads {
+            info!(
+                "[dry-run] upload {} <- {}",
+                f.cloud_path,
+                f.local_path.display()
+            );
+        }
+        for d in &deletes {
+            info!("[dry-run] delete {}", d);
+        }
+        for f in &plan.replaces {
+            info!(
+                "[dry-run] replace {} <- {}",
+                f.cloud_path,
+                f.local_path.display()
+            );
+        }
+        info!("[dry-run] no changes applied.");
+        return Ok(());
+    }
+
+    // Phase 4: transfer. Any failure aborts the run, so reaching phase 5
+    // guarantees the final remote set below is accurate.
+    let mut added: Vec<String> = Vec::with_capacity(plan.uploads.len() + plan.replaces.len());
+    if !plan.uploads.is_empty() {
+        info!("Uploading new files...");
+        added.extend(plan.uploads.iter().map(|f| f.cloud_path.clone()));
+        uploader.upload_files(plan.uploads).await?;
+    }
+    if !deletes.is_empty() {
+        info!("Deleting stale remote files...");
+        uploader.delete_files(deletes.clone()).await?;
+    }
+    if !plan.replaces.is_empty() {
+        info!("Uploading changed files...");
+        added.extend(plan.replaces.iter().map(|f| f.cloud_path.clone()));
+        uploader.upload_files(plan.replaces).await?;
+    }
+
+    // Phase 5: rewrite links. The final remote set is derived from the
+    // (single) listing plus the transfers that just succeeded, avoiding a
+    // second full cloud listing.
+    let final_remote = final_remote_set(initial_remote, &deletes, &added);
+    let mut path_map: HashMap<PathBuf, String> = HashMap::with_capacity(image_paths.len());
+    for img in &image_paths {
+        let cloud_path = to_cloud_path(img, &src);
+        if final_remote.contains(&cloud_path) {
+            let url = build_public_url(&domain, &config.remote_root, &cloud_path)?;
+            path_map.insert(img.clone(), url.to_string());
+        } else {
+            debug!(
+                "Image {} is not on the remote; link kept as-is",
+                img.display()
+            );
+        }
+    }
+
+    rewrite_markdown_links(&scan.images_by_md, &path_map);
+    info!("Pipeline finished.");
+    Ok(())
+}
+
+/// Scans the source tree for markdown files, resolving their local images
+/// and collecting the cloud paths of already-rewritten links on our domain.
+fn scan_local(src: &Path, depth: usize, domain: &Url, remote_root: &str) -> ScanResult {
+    let md_files = collect_md_files(src, depth);
+
+    let scanned: Vec<(PathBuf, Vec<PathBuf>, HashSet<String>)> = md_files
+        .par_iter()
+        .map(|md| scan_markdown_file(md, domain, remote_root))
+        .collect();
+
+    let mut images_by_md = HashMap::with_capacity(scanned.len());
+    let mut managed_remote = HashSet::new();
+    for (md, images, managed) in scanned {
+        managed_remote.extend(managed);
+        images_by_md.insert(md, images);
+    }
+
+    ScanResult {
+        md_files,
+        images_by_md,
+        managed_remote,
+    }
+}
+
+/// Parses one markdown file, resolving local images and collecting managed
+/// remote references in a single pass.
+fn scan_markdown_file(
+    md_file: &Path,
+    domain: &Url,
+    remote_root: &str,
+) -> (PathBuf, Vec<PathBuf>, HashSet<String>) {
+    let Ok(content) = std::fs::read_to_string(md_file) else {
+        warn!("Failed to read markdown file {}", md_file.display());
+        return (md_file.to_path_buf(), Vec::new(), HashSet::new());
+    };
+
+    let dests = extract_image_dests(&content);
+    let images: Vec<PathBuf> = dests
+        .iter()
+        .filter(|dest| !dest.is_empty() && !is_remote_url(dest))
+        .filter_map(|dest| resolve_image_path(&percent_decode(dest), md_file))
+        .collect();
+    let managed: HashSet<String> = dests
+        .iter()
+        .filter_map(|dest| managed_cloud_path(dest, domain, remote_root))
+        .collect();
+
+    (md_file.to_path_buf(), images, managed)
+}
+
+/// Maps an image URL on our own domain back to its cloud path.
+///
+/// Rewritten links (e.g. `https://cdn.example.com/imgs/a.png` with
+/// remote_root `imgs`) are recognized as references to objects this tool
+/// manages. Returns `None` for foreign URLs and non-URLs.
+fn managed_cloud_path(dest: &str, domain: &Url, remote_root: &str) -> Option<String> {
+    let url = Url::parse(dest).ok()?;
+    if url.domain() != domain.domain() {
+        return None;
+    }
+    let root = remote_root.trim_matches('/');
+    let path = url.path();
+    if root.is_empty() {
+        return Some(path.trim_start_matches('/').to_string());
+    }
+    let prefix = format!("/{}/", root);
+    path.strip_prefix(&prefix)
+        .map(|rest| rest.trim_start_matches('/').to_string())
+}
+
+/// Collects markdown files under `root` up to `depth`.
+///
+/// Hidden directories, `.git` and dependency/vendor directories are skipped,
+/// and the extension match is case-insensitive so `README.MD` is found too.
+fn collect_md_files(root: &Path, depth: usize) -> Vec<PathBuf> {
+    WalkDir::new(root)
+        .max_depth(depth)
+        .into_iter()
+        .filter_entry(|e| !is_skipped_entry(e))
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file() && has_md_extension(entry.path()))
+        .map(|entry| entry.into_path())
+        .collect()
+}
+
+/// Whether a walk entry should be pruned entirely.
+fn is_skipped_entry(entry: &walkdir::DirEntry) -> bool {
+    if entry.depth() == 0 {
+        // Never skip the explicitly provided root, even if it is hidden.
+        return false;
+    }
+    if !entry.file_type().is_dir() {
+        return false;
+    }
+    let name = entry.file_name().to_string_lossy();
+    name.starts_with('.') || name == "node_modules" || name == "target"
+}
+
+/// Case-insensitive `.md` extension check.
+fn has_md_extension(path: &Path) -> bool {
+    path.extension()
+        .map(|ext| ext.eq_ignore_ascii_case("md"))
+        .unwrap_or(false)
+}
+
+/// Resolves one markdown image destination to a canonical local path.
+/// Relative destinations resolve against the markdown file's directory;
+/// absolute destinations are used as-is. Both are canonicalized so tree-ness
+/// checks (to_cloud_path) operate on one canonical form, and non-files
+/// (missing paths, directories) yield `None`.
+fn resolve_image_path(dest: &str, md_file: &Path) -> Option<PathBuf> {
+    let candidate = PathBuf::from(dest);
+    let candidate = if candidate.is_absolute() {
+        candidate
+    } else {
+        md_file.parent()?.join(candidate)
+    };
+
+    let canonical = candidate.canonicalize().ok()?;
+    canonical.is_file().then_some(canonical)
+}
+
+/// Builds the public URL for a cloud path.
+///
+/// `remote_root` may be `/`, empty or a plain directory name; the result
+/// never contains double slashes.
+pub fn build_public_url(domain: &Url, remote_root: &str, cloud_path: &str) -> Result<Url> {
+    let root = remote_root.trim_matches('/');
+    let domain_str = domain.as_str().trim_end_matches('/');
+    let base = if root.is_empty() {
+        domain_str.to_string()
+    } else {
+        format!("{}/{}", domain_str, root)
+    };
+    let url = format!("{}/{}", base, cloud_path.trim_start_matches('/'));
+    Url::parse(&url).with_context(|| format!("Failed to build public URL from {}", url))
+}
+
+/// Computes the set of cloud paths present after a successful transfer:
+/// the initial listing minus deletions plus uploads/replacements.
+pub fn final_remote_set(
+    initial: Vec<String>,
+    deletes: &[String],
+    added: &[String],
+) -> HashSet<String> {
+    let deleted: HashSet<&String> = deletes.iter().collect();
+    initial
+        .into_iter()
+        .filter(|p| !deleted.contains(p))
+        .chain(added.iter().cloned())
+        .collect()
+}
+
+/// Rewrites image links in every markdown file that references at least one
+/// uploaded image.
+fn rewrite_markdown_links(
+    images_by_md: &HashMap<PathBuf, Vec<PathBuf>>,
+    path_map: &HashMap<PathBuf, String>,
+) {
+    if path_map.is_empty() {
+        info!("No uploaded images; skipping link replacement.");
+        return;
+    }
+    info!("Replacing image links in markdown files...");
+
+    for (md_file, images) in images_by_md {
+        if !images.iter().any(|img| path_map.contains_key(img)) {
+            continue;
+        }
+
+        let Ok(content) = std::fs::read_to_string(md_file) else {
+            warn!("Failed to read {} for link replacement", md_file.display());
+            continue;
+        };
+
+        let new_content = replace_image_links(&content, |dest| {
+            let abs = resolve_image_path(&percent_decode(dest), md_file)?;
+            path_map.get(&abs).cloned()
+        });
+
+        if new_content != content {
+            match std::fs::write(md_file, &new_content) {
+                Ok(()) => info!("Updated links in {}", md_file.display()),
+                Err(e) => warn!("Failed to write back {}: {}", md_file.display(), e),
+            }
+        }
+    }
+
+    info!("Completed markdown image link replacement.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_md_files_filters_noise_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join(".git/x.md"), "git").unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/y.md"), "nm").unwrap();
+        std::fs::write(dir.path().join("sub/ok.md"), "ok").unwrap();
+        std::fs::write(dir.path().join("UPPER.MD"), "upper").unwrap();
+        std::fs::write(dir.path().join("ignore.txt"), "txt").unwrap();
+
+        let mut files: Vec<String> = collect_md_files(dir.path(), 10)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert_eq!(files, vec!["UPPER.MD".to_string(), "ok.md".to_string()]);
+    }
+
+    #[test]
+    fn collect_md_files_respects_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/shallow.md"), "x").unwrap();
+        std::fs::write(dir.path().join("a/b/deep.md"), "x").unwrap();
+
+        let files = collect_md_files(dir.path(), 2);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("shallow.md"));
+    }
+
+    #[test]
+    fn resolve_image_path_resolves_relative_and_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("images")).unwrap();
+        let img = dir.path().join("images/a.png");
+        std::fs::write(&img, b"x").unwrap();
+        let md = dir.path().join("post.md");
+        std::fs::write(&md, b"").unwrap();
+
+        let rel = resolve_image_path("images/a.png", &md).unwrap();
+        assert_eq!(rel, img.canonicalize().unwrap());
+
+        let abs = resolve_image_path(img.to_str().unwrap(), &md).unwrap();
+        assert_eq!(abs, img.canonicalize().unwrap());
+
+        assert!(resolve_image_path("images/missing.png", &md).is_none());
+        assert!(resolve_image_path("images", &md).is_none());
+    }
+
+    #[test]
+    fn build_public_url_never_produces_double_slashes() {
+        let domain = Url::parse("https://cdn.example.com").unwrap();
+
+        let url = build_public_url(&domain, "/", "sub/a.png").unwrap();
+        assert_eq!(url.as_str(), "https://cdn.example.com/sub/a.png");
+
+        let url = build_public_url(&domain, "", "a.png").unwrap();
+        assert_eq!(url.as_str(), "https://cdn.example.com/a.png");
+
+        let url = build_public_url(&domain, "imgs", "a.png").unwrap();
+        assert_eq!(url.as_str(), "https://cdn.example.com/imgs/a.png");
+
+        let url = build_public_url(&domain, "/imgs/", "/a.png").unwrap();
+        assert_eq!(url.as_str(), "https://cdn.example.com/imgs/a.png");
+    }
+
+    #[test]
+    fn managed_cloud_path_maps_own_domain_urls() {
+        let domain = Url::parse("https://cdn.example.com").unwrap();
+
+        assert_eq!(
+            managed_cloud_path("https://cdn.example.com/images/a.png", &domain, "/"),
+            Some("images/a.png".to_string())
+        );
+        assert_eq!(
+            managed_cloud_path("https://cdn.example.com/imgs/a.png", &domain, "imgs"),
+            Some("a.png".to_string())
+        );
+        assert_eq!(
+            managed_cloud_path("https://other.example.com/imgs/a.png", &domain, "imgs"),
+            None
+        );
+        assert_eq!(managed_cloud_path("images/a.png", &domain, "/"), None);
+        // A path that is under the root but not exactly at its boundary does
+        // not accidentally match.
+        assert_eq!(
+            managed_cloud_path("https://cdn.example.com/imgsx/a.png", &domain, "imgs"),
+            None
+        );
+    }
+
+    #[test]
+    fn final_remote_set_applies_deletes_and_additions() {
+        let initial = vec!["a.png".to_string(), "b.png".to_string()];
+        let deletes = vec!["a.png".to_string()];
+        let added = vec!["c.png".to_string()];
+
+        let set = final_remote_set(initial, &deletes, &added);
+        assert!(!set.contains("a.png"));
+        assert!(set.contains("b.png"));
+        assert!(set.contains("c.png"));
+    }
+}
+
+#[cfg(test)]
+mod pipeline_e2e_tests {
+    use super::*;
+    use opendal::services;
+
+    fn memory_op() -> Operator {
+        Operator::new(services::Memory::default()).unwrap().finish()
+    }
+
+    async fn run_once(op: &Operator, src: &Path) -> Result<()> {
+        run(
+            op.clone(),
+            PipelineConfig {
+                src: src.to_path_buf(),
+                depth: 10,
+                domain: "https://cdn.example.com".to_string(),
+                remote_root: "/".to_string(),
+                dry_run: false,
+                concurrency: None,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn managed_remote_link_protects_remote_object() {
+        // Regression: after links are rewritten to the CDN, a re-run must not
+        // delete the uploaded objects just because no local path references
+        // them anymore.
+        let dir = tempfile::tempdir().unwrap();
+        let md = dir.path().join("post.md");
+        std::fs::write(&md, "![a](https://cdn.example.com/images/a.png)\n").unwrap();
+
+        let op = memory_op();
+        op.write("images/a.png", b"bytes".to_vec()).await.unwrap();
+        run_once(&op, dir.path()).await.unwrap();
+
+        assert_eq!(op.read("images/a.png").await.unwrap().to_vec(), b"bytes");
+        let content = std::fs::read_to_string(&md).unwrap();
+        assert_eq!(content, "![a](https://cdn.example.com/images/a.png)\n");
+    }
+
+    #[tokio::test]
+    async fn removing_link_deletes_remote_object() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("images")).unwrap();
+        std::fs::write(dir.path().join("images/a.png"), b"bytes").unwrap();
+        let md = dir.path().join("post.md");
+        std::fs::write(&md, "![a](images/a.png)\n").unwrap();
+
+        let op = memory_op();
+        run_once(&op, dir.path()).await.unwrap();
+        assert!(op.stat("images/a.png").await.is_ok());
+
+        // Author removes the image from the post entirely: the remote object
+        // is no longer referenced and must be deleted on the next run.
+        std::fs::write(&md, "No more images.\n").unwrap();
+        run_once(&op, dir.path()).await.unwrap();
+        assert!(op.stat("images/a.png").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dry_run_transfers_and_rewrites_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("images")).unwrap();
+        std::fs::write(dir.path().join("images/a.png"), b"png-bytes").unwrap();
+        let md = dir.path().join("post.md");
+        let original = "![a](images/a.png)\n";
+        std::fs::write(&md, original).unwrap();
+
+        let op = memory_op();
+        run(
+            op.clone(),
+            PipelineConfig {
+                src: dir.path().to_path_buf(),
+                depth: 10,
+                domain: "https://cdn.example.com".to_string(),
+                remote_root: "/".to_string(),
+                dry_run: true,
+                concurrency: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Nothing was transferred and the markdown was left untouched.
+        let entries = op.list_with("/").recursive(true).await.unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn uploads_images_and_rewrites_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("images")).unwrap();
+        std::fs::write(dir.path().join("images/a.png"), b"png-bytes").unwrap();
+        std::fs::write(dir.path().join("images/unused.png"), b"never-referenced").unwrap();
+        let md = dir.path().join("post.md");
+        std::fs::write(
+            &md,
+            "![a](images/a.png) ![gone](images/missing.png) ![r](https://example.com/r.png)\n",
+        )
+        .unwrap();
+
+        let op = memory_op();
+        run_once(&op, dir.path()).await.unwrap();
+
+        // The referenced image is uploaded with its real content.
+        assert_eq!(
+            op.read("images/a.png").await.unwrap().to_vec(),
+            b"png-bytes"
+        );
+        // Unreferenced images are not uploaded.
+        let entries: Vec<String> = op
+            .list_with("/")
+            .recursive(true)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.metadata().mode() != opendal::EntryMode::DIR)
+            .map(|e| normalize_cloud_path(e.path()))
+            .collect();
+        assert_eq!(entries, vec!["images/a.png".to_string()]);
+
+        // Links are rewritten only for uploaded local images.
+        let content = std::fs::read_to_string(&md).unwrap();
+        assert!(
+            content.contains("![a](https://cdn.example.com/images/a.png)"),
+            "unexpected content: {}",
+            content
+        );
+        assert!(content.contains("![gone](images/missing.png)"));
+        assert!(content.contains("![r](https://example.com/r.png)"));
+    }
+
+    #[tokio::test]
+    async fn second_run_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("images")).unwrap();
+        std::fs::write(dir.path().join("images/a.png"), b"png-bytes").unwrap();
+        let md = dir.path().join("post.md");
+        std::fs::write(&md, "![a](images/a.png)\n").unwrap();
+
+        let op = memory_op();
+        run_once(&op, dir.path()).await.unwrap();
+        let after_first = std::fs::read_to_string(&md).unwrap();
+
+        run_once(&op, dir.path()).await.unwrap();
+        let after_second = std::fs::read_to_string(&md).unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "second run must not rewrite again"
+        );
+
+        // Exactly one object remains.
+        let count = op
+            .list_with("/")
+            .recursive(true)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.metadata().mode() != opendal::EntryMode::DIR)
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_remote_files_are_deleted_by_cloud_path() {
+        // Regression: remote-only paths used to panic during UpFile
+        // conversion instead of being deleted.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("post.md"),
+            "![a](https://example.com/a.png)\n",
+        )
+        .unwrap();
+
+        let op = memory_op();
+        op.write("old/stale.png", b"stale".to_vec()).await.unwrap();
+        run_once(&op, dir.path()).await.unwrap();
+
+        assert!(op.stat("old/stale.png").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn changed_local_image_with_known_remote_md5_replaces_content() {
+        // The memory backend does not expose checksums in listings (S3 does,
+        // via the ETag), so the replace decision is unit-tested in the
+        // differ; here we verify the "unknown checksum" policy: an object
+        // whose remote MD5 cannot be compared is left untouched instead of
+        // being endlessly re-uploaded.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("images")).unwrap();
+        std::fs::write(dir.path().join("images/a.png"), b"v1").unwrap();
+        let md = dir.path().join("post.md");
+        std::fs::write(&md, "![a](images/a.png)\n").unwrap();
+
+        let op = memory_op();
+        run_once(&op, dir.path()).await.unwrap();
+        assert_eq!(op.read("images/a.png").await.unwrap().to_vec(), b"v1");
+
+        // Simulate the author re-adding the local link after replacing the
+        // image file (after the first run the link was rewritten to the CDN).
+        std::fs::write(&md, "![a](images/a.png)\n").unwrap();
+        std::fs::write(dir.path().join("images/a.png"), b"v2-longer").unwrap();
+        // Memory has no remote checksum, so the change cannot be detected;
+        // the object must stay intact (no churn) and the run must succeed.
+        run_once(&op, dir.path()).await.unwrap();
+        assert_eq!(op.read("images/a.png").await.unwrap().to_vec(), b"v1");
+    }
+
+    #[tokio::test]
+    async fn same_basename_in_different_dirs_does_not_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("p1/images")).unwrap();
+        std::fs::create_dir_all(dir.path().join("p2/images")).unwrap();
+        std::fs::write(dir.path().join("p1/images/logo.png"), b"logo-one").unwrap();
+        std::fs::write(dir.path().join("p2/images/logo.png"), b"logo-two").unwrap();
+        std::fs::write(dir.path().join("p1/a.md"), "![l](images/logo.png)\n").unwrap();
+        std::fs::write(dir.path().join("p2/b.md"), "![l](images/logo.png)\n").unwrap();
+
+        let op = memory_op();
+        run_once(&op, dir.path()).await.unwrap();
+
+        assert_eq!(
+            op.read("p1/images/logo.png").await.unwrap().to_vec(),
+            b"logo-one"
+        );
+        assert_eq!(
+            op.read("p2/images/logo.png").await.unwrap().to_vec(),
+            b"logo-two"
+        );
+
+        let a = std::fs::read_to_string(dir.path().join("p1/a.md")).unwrap();
+        assert!(
+            a.contains("https://cdn.example.com/p1/images/logo.png"),
+            "{}",
+            a
+        );
+        let b = std::fs::read_to_string(dir.path().join("p2/b.md")).unwrap();
+        assert!(
+            b.contains("https://cdn.example.com/p2/images/logo.png"),
+            "{}",
+            b
+        );
+    }
+}

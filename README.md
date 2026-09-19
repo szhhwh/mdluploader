@@ -48,13 +48,31 @@ mdluploader upload /path/to/markdown/folder \
 参数:
 - `path`: 包含要扫描的Markdown文件的目录（必需）
 - `-b, --bucket`: S3 存储桶名称（必需）
-- `-a, --ak`: S3访问密钥（必需）
-- `-s, --sk`: S3密钥（必需）
+- `-a, --ak`: S3访问密钥（必需，可用环境变量 `MDLUPLOADER_AK` 代替）
+- `-s, --sk`: S3密钥（必需，推荐用环境变量 `MDLUPLOADER_SK` 代替，避免泄露到 shell 历史与进程列表）
 - `-g, --region`: S3区域（必需）
 - `-e, --endpoint`: S3端点URL（必需）
 - `-r, --remote-root`: S3远端目录（可选）
 - `-d, --domain`: S3自定义访问域名（必需）
 - `--depth`: 扫描的最大目录深度（默认值：10）
+- `--dry-run`: 只打印将要上传/删除/替换的文件，不执行任何实际操作
+- `--concurrency`: 并发传输数上限（默认按 CPU 数自动计算，限制在 4..=32）
+
+示例：
+
+```bash
+# 使用环境变量传递密钥（推荐）
+export MDLUPLOADER_AK=ACCESS_KEY
+export MDLUPLOADER_SK=SECRET_KEY
+
+# 预览将要发生的变更
+mdluploader upload /path/to/markdown/folder \
+  --bucket my-bucket \
+  --region us-west-1 \
+  --endpoint https://s3.us-west-1.amazonaws.com \
+  --domain https://www.example.com \
+  --dry-run
+```
 
 ## 工作原理
 
