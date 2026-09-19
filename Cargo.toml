@@ -10,14 +10,14 @@ build = "build.rs"
 anyhow = "1.0.98"
 clap = { version = "4.5.37", features = ["derive", "env"] }
 env_logger = "0.11.8"
-futures = "0.3.31"
+futures = { version = "0.3.31", default-features = false, features = ["std"] }
 log = "0.4.27"
 md-5 = "0.10.6"
 pulldown-cmark = { version = "0.13", default-features = false }
 percent-encoding = "2.3"
 opendal = { version = "0.53.1", features = ["services-s3"] }
 rayon = "1.10.0"
-tokio = { version = "1.45.0", features = ["full"] }
+tokio = { version = "1.45.0", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 walkdir = "2.5.0"
 clap_complete = "4.5.50"
 url = "2.5.4"
