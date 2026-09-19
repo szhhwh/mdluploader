@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -10,6 +11,9 @@ pub struct Args {
 }
 
 #[derive(Subcommand, Debug)]
+// `Upload` holds its parsed arguments inline; the enum is built once per run
+// and never hot-pathed, so the size difference with `Completions` is fine.
+#[allow(clippy::large_enum_variant)]
 pub enum Commands {
     /// Upload to cloud
     Upload {
@@ -60,6 +64,13 @@ pub enum Commands {
         #[arg(long)]
         concurrency: Option<usize>,
     },
+
+    /// Generate a completion script for the given shell
+    Completions {
+        /// Shell to generate the completion script for
+        #[arg(required = true)]
+        shell: Shell,
+    },
 }
 
 #[cfg(test)]
@@ -108,7 +119,10 @@ mod tests {
             remote_root,
             dry_run,
             concurrency,
-        } = args.command;
+        } = args.command
+        else {
+            panic!("expected upload command");
+        };
 
         assert_eq!(path, PathBuf::from("/path/to/md"));
         assert_eq!(depth, 3);
@@ -150,7 +164,10 @@ mod tests {
             dry_run,
             concurrency,
             ..
-        } = args.command;
+        } = args.command
+        else {
+            panic!("expected upload command");
+        };
         assert!(dry_run);
         assert_eq!(concurrency, Some(7));
     }
@@ -176,11 +193,29 @@ mod tests {
             "https://d",
         ]);
 
-        let Commands::Upload { ak, sk, .. } = args.command;
+        let Commands::Upload { ak, sk, .. } = args.command else {
+            panic!("expected upload command");
+        };
         assert_eq!(ak, "env-ak");
         assert_eq!(sk, "env-sk");
 
         std::env::remove_var("MDLUPLOADER_AK");
         std::env::remove_var("MDLUPLOADER_SK");
+    }
+
+    #[test]
+    fn parses_completions_command() {
+        let args = Args::parse_from(["mdluploader", "completions", "bash"]);
+        let Commands::Completions { shell } = args.command else {
+            panic!("expected completions command");
+        };
+        assert_eq!(shell, Shell::Bash);
+    }
+
+    #[test]
+    fn completions_script_is_generated_without_panic() {
+        let mut buf: Vec<u8> = Vec::new();
+        clap_complete::generate(Shell::Bash, &mut Args::command(), "mdluploader", &mut buf);
+        assert!(!buf.is_empty());
     }
 }
