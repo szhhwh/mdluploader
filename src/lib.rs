@@ -1,34 +1,13 @@
 pub mod cli;
 pub mod differ;
 pub mod mdparser;
+pub mod pipeline;
 pub mod uploader;
 
 use anyhow::{Context, Result};
-use log::debug;
 use md5::Digest;
 use std::io::Read;
 use std::path::Path;
-use walkdir::WalkDir;
-
-/// Read the file list under the specified path
-/// # Arguments
-/// - `path` - The path to read
-/// - `depth` - Recursion depth
-/// # Return
-/// - `Result<Vec<walkdir::DirEntry>, std::io::Error>` - Returns the file list or an error
-pub fn read_file_list<P: AsRef<Path> + std::fmt::Debug>(
-    path: &P,
-    depth: &usize,
-) -> Result<Vec<walkdir::DirEntry>> {
-    // Create file list
-    let mut file_list: Vec<walkdir::DirEntry> = Vec::new();
-    // Traverse directory
-    debug!("traversing directory: {:?}", path);
-    for item in WalkDir::new(path).max_depth(*depth) {
-        file_list.push(item?);
-    }
-    Ok(file_list)
-}
 
 /// Computes the MD5 checksum of a file.
 ///
