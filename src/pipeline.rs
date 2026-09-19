@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use log::{debug, info, warn};
 use opendal::Operator;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use url::Url;
 use walkdir::WalkDir;
 
@@ -42,8 +42,9 @@ pub struct PipelineConfig {
 /// Result of scanning the local markdown tree.
 #[derive(Debug, Default)]
 struct ScanResult {
-    /// All markdown files found.
-    md_files: Vec<PathBuf>,
+    /// Number of markdown files found; the paths themselves are consumed by
+    /// the parallel scan, so only the count is kept.
+    md_count: usize,
     /// For every markdown file, the resolved local image paths it references.
     /// Built once and reused for hashing and link rewriting, so each markdown
     /// file is parsed exactly once per run.
@@ -52,6 +53,16 @@ struct ScanResult {
     /// domain. These objects must not be deleted by the diff just because
     /// no local file references them anymore.
     managed_remote: HashSet<String>,
+}
+
+/// Per-file result of scanning one markdown file.
+#[derive(Debug, Default)]
+struct ScannedFile {
+    /// The resolved local image paths the file references.
+    images: Vec<PathBuf>,
+    /// Cloud paths referenced through already-rewritten URLs on our own
+    /// domain (see [`ScanResult::managed_remote`]).
+    managed: HashSet<String>,
 }
 
 /// Runs the full upload pipeline.
@@ -71,7 +82,7 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
 
     // Phase 1: scan markdown files and their local images.
     let scan = scan_local(&src, config.depth, &domain, &config.remote_root);
-    info!("Found {} markdown files.", scan.md_files.len());
+    info!("Found {} markdown files.", scan.md_count);
     let image_paths: HashSet<PathBuf> = scan.images_by_md.values().flatten().cloned().collect();
     info!(
         "{} image links detected in markdown files.",
@@ -79,13 +90,15 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
     );
     debug!("Local images: {:?}", image_paths);
 
-    // Phase 2: hash local images and map them to cloud paths.
+    // Phase 2: hash local images and map them to cloud paths. The set is
+    // consumed by value so each path is moved into its `LocalImage` instead
+    // of being cloned.
     let local_images: Vec<LocalImage> = image_paths
-        .par_iter()
-        .filter_map(|img| match get_file_md5(img) {
+        .into_par_iter()
+        .filter_map(|img| match get_file_md5(&img) {
             Ok(md5) => Some(LocalImage {
-                local_path: img.clone(),
-                cloud_path: to_cloud_path(img, &src),
+                cloud_path: to_cloud_path(&img, &src),
+                local_path: img,
                 md5,
             }),
             Err(e) => {
@@ -121,7 +134,9 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
         })
         .collect();
 
-    let plan = diff(local_images, remote_images);
+    // The diff borrows the local images; the pipeline still owns them and
+    // reuses the computed cloud paths for link rewriting in phase 5.
+    let plan = diff(&local_images, remote_images);
     // Objects still referenced through rewritten URLs on our own domain are
     // managed; only delete remote objects nobody references anymore.
     let deletes: Vec<String> = plan
@@ -162,38 +177,43 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
         return Ok(());
     }
 
-    // Phase 4: transfer. Any failure aborts the run, so reaching phase 5
-    // guarantees the final remote set below is accurate.
-    let mut added: Vec<String> = Vec::with_capacity(plan.uploads.len() + plan.replaces.len());
+    // Phase 4: transfer. The final remote set depends only on the plan (a
+    // transfer either completes and matches the plan or aborts the run), so
+    // it is derived up front from the single listing; afterwards every batch
+    // is handed to the uploader by value.
+    let added: Vec<String> = plan
+        .uploads
+        .iter()
+        .chain(plan.replaces.iter())
+        .map(|f| f.cloud_path.clone())
+        .collect();
+    let final_remote = final_remote_set(initial_remote, &deletes, &added);
     if !plan.uploads.is_empty() {
         info!("Uploading new files...");
-        added.extend(plan.uploads.iter().map(|f| f.cloud_path.clone()));
         uploader.upload_files(plan.uploads).await?;
     }
     if !deletes.is_empty() {
         info!("Deleting stale remote files...");
-        uploader.delete_files(deletes.clone()).await?;
+        uploader.delete_files(deletes).await?;
     }
     if !plan.replaces.is_empty() {
         info!("Uploading changed files...");
-        added.extend(plan.replaces.iter().map(|f| f.cloud_path.clone()));
         uploader.upload_files(plan.replaces).await?;
     }
 
-    // Phase 5: rewrite links. The final remote set is derived from the
-    // (single) listing plus the transfers that just succeeded, avoiding a
-    // second full cloud listing.
-    let final_remote = final_remote_set(initial_remote, &deletes, &added);
-    let mut path_map: HashMap<PathBuf, String> = HashMap::with_capacity(image_paths.len());
-    for img in &image_paths {
-        let cloud_path = to_cloud_path(img, &src);
-        if final_remote.contains(&cloud_path) {
-            let url = build_public_url(&domain, &config.remote_root, &cloud_path)?;
-            path_map.insert(img.clone(), url.to_string());
+    // Phase 5: rewrite links. Walk the hashed local images directly: their
+    // cloud paths were computed once in phase 2, and images whose hash failed
+    // were never uploaded, so their links must stay untouched. Consuming the
+    // vector moves each path into the map without cloning.
+    let mut path_map: HashMap<PathBuf, String> = HashMap::with_capacity(local_images.len());
+    for img in local_images {
+        if final_remote.contains(&img.cloud_path) {
+            let url = build_public_url(&domain, &config.remote_root, &img.cloud_path)?;
+            path_map.insert(img.local_path, url.to_string());
         } else {
             debug!(
                 "Image {} is not on the remote; link kept as-is",
-                img.display()
+                img.local_path.display()
             );
         }
     }
@@ -221,50 +241,50 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
 /// and collecting the cloud paths of already-rewritten links on our domain.
 fn scan_local(src: &Path, depth: usize, domain: &Url, remote_root: &str) -> ScanResult {
     let md_files = collect_md_files(src, depth);
+    let md_count = md_files.len();
 
-    let scanned: Vec<(PathBuf, Vec<PathBuf>, HashSet<String>)> = md_files
-        .par_iter()
+    // Consume the file list so each owned path is moved into the scan result
+    // instead of being cloned per file.
+    let scanned: Vec<(PathBuf, ScannedFile)> = md_files
+        .into_par_iter()
         .map(|md| scan_markdown_file(md, domain, remote_root))
         .collect();
 
     let mut images_by_md = HashMap::with_capacity(scanned.len());
     let mut managed_remote = HashSet::new();
-    for (md, images, managed) in scanned {
-        managed_remote.extend(managed);
-        images_by_md.insert(md, images);
+    for (md, file) in scanned {
+        managed_remote.extend(file.managed);
+        images_by_md.insert(md, file.images);
     }
 
     ScanResult {
-        md_files,
+        md_count,
         images_by_md,
         managed_remote,
     }
 }
 
 /// Parses one markdown file, resolving local images and collecting managed
-/// remote references in a single pass.
-fn scan_markdown_file(
-    md_file: &Path,
-    domain: &Url,
-    remote_root: &str,
-) -> (PathBuf, Vec<PathBuf>, HashSet<String>) {
-    let Ok(content) = std::fs::read_to_string(md_file) else {
+/// remote references in a single pass. Takes the file path by value and
+/// returns it unchanged as the map key.
+fn scan_markdown_file(md_file: PathBuf, domain: &Url, remote_root: &str) -> (PathBuf, ScannedFile) {
+    let Ok(content) = std::fs::read_to_string(&md_file) else {
         warn!("Failed to read markdown file {}", md_file.display());
-        return (md_file.to_path_buf(), Vec::new(), HashSet::new());
+        return (md_file, ScannedFile::default());
     };
 
     let dests = extract_image_dests(&content);
     let images: Vec<PathBuf> = dests
         .iter()
         .filter(|dest| !dest.is_empty() && !is_remote_url(dest))
-        .filter_map(|dest| resolve_image_path(&percent_decode(dest), md_file))
+        .filter_map(|dest| resolve_image_path(&percent_decode(dest), &md_file))
         .collect();
     let managed: HashSet<String> = dests
         .iter()
         .filter_map(|dest| managed_cloud_path(dest, domain, remote_root))
         .collect();
 
-    (md_file.to_path_buf(), images, managed)
+    (md_file, ScannedFile { images, managed })
 }
 
 /// Maps an image URL on our own domain back to its cloud path.

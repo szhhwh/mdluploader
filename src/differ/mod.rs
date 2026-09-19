@@ -71,18 +71,18 @@ pub struct DiffPlan {
 ///     md5: Some("md5hash2".to_string()),
 /// }];
 ///
-/// let plan = diff(local, remote);
+/// let plan = diff(&local, remote);
 /// assert_eq!(plan.uploads.len(), 1);
 /// assert_eq!(plan.deletes.len(), 1);
 /// assert_eq!(plan.replaces.len(), 0);
 /// ```
-pub fn diff(local: Vec<LocalImage>, remote: Vec<RemoteImage>) -> DiffPlan {
+pub fn diff(local: &[LocalImage], remote: Vec<RemoteImage>) -> DiffPlan {
     // Sort before deduplication so the choice of a surviving entry is
     // deterministic regardless of parallel collection order upstream.
-    let mut local_sorted = local;
+    let mut local_sorted: Vec<&LocalImage> = local.iter().collect();
     local_sorted.sort_by(|a, b| a.cloud_path.cmp(&b.cloud_path));
 
-    let mut local_map: HashMap<String, LocalImage> = HashMap::with_capacity(local_sorted.len());
+    let mut local_map: HashMap<String, &LocalImage> = HashMap::with_capacity(local_sorted.len());
     for image in local_sorted {
         if local_map.contains_key(&image.cloud_path) {
             warn!(
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn local_only_files_are_uploaded() {
-        let plan = diff(vec![local("a.png", "m1")], vec![]);
+        let plan = diff(&[local("a.png", "m1")], vec![]);
         assert_eq!(plan.uploads.len(), 1);
         assert_eq!(plan.uploads[0].cloud_path, "a.png");
         assert!(plan.deletes.is_empty());
@@ -178,14 +178,14 @@ mod tests {
     fn remote_only_files_are_deleted_by_cloud_path() {
         // Regression: remote-only paths used to be converted with a local
         // strip_prefix and panicked. They must be deleted as cloud paths.
-        let plan = diff(vec![], vec![remote("sub/b.png", Some("m2"))]);
+        let plan = diff(&[], vec![remote("sub/b.png", Some("m2"))]);
         assert_eq!(plan.deletes, vec!["sub/b.png".to_string()]);
     }
 
     #[test]
     fn identical_files_need_no_action_even_with_case_difference() {
         let plan = diff(
-            vec![local("a.png", "abc123")],
+            &[local("a.png", "abc123")],
             vec![remote("a.png", Some("ABC123"))],
         );
         assert!(plan.uploads.is_empty());
@@ -195,10 +195,7 @@ mod tests {
 
     #[test]
     fn changed_files_are_replaced() {
-        let plan = diff(
-            vec![local("a.png", "m1")],
-            vec![remote("a.png", Some("m2"))],
-        );
+        let plan = diff(&[local("a.png", "m1")], vec![remote("a.png", Some("m2"))]);
         assert_eq!(plan.replaces.len(), 1);
         assert_eq!(plan.replaces[0].cloud_path, "a.png");
         assert!(plan.uploads.is_empty());
@@ -208,7 +205,7 @@ mod tests {
     #[test]
     fn unknown_remote_checksum_is_left_alone() {
         // Multipart ETags must not trigger endless replacement.
-        let plan = diff(vec![local("a.png", "m1")], vec![remote("a.png", None)]);
+        let plan = diff(&[local("a.png", "m1")], vec![remote("a.png", None)]);
         assert!(plan.uploads.is_empty());
         assert!(plan.deletes.is_empty());
         assert!(plan.replaces.is_empty());
@@ -219,7 +216,7 @@ mod tests {
         // The diff itself receives normalized paths; verify the join survives
         // mixed forms via explicit normalization upstream is not needed here.
         let plan = diff(
-            vec![local("sub/a.png", "m1")],
+            &[local("sub/a.png", "m1")],
             vec![remote("sub/a.png", Some("m1"))],
         );
         assert!(plan.replaces.is_empty());
@@ -229,7 +226,7 @@ mod tests {
     fn same_basename_in_different_dirs_does_not_collide() {
         // Regression: the old basename-only diff treated these as one file.
         let plan = diff(
-            vec![local("sub1/a.png", "m1"), local("sub2/a.png", "m2")],
+            &[local("sub1/a.png", "m1"), local("sub2/a.png", "m2")],
             vec![],
         );
         assert_eq!(plan.uploads.len(), 2);
@@ -237,7 +234,7 @@ mod tests {
 
     #[test]
     fn duplicate_local_cloud_paths_are_deduplicated() {
-        let plan = diff(vec![local("a.png", "m1"), local("a.png", "m1")], vec![]);
+        let plan = diff(&[local("a.png", "m1"), local("a.png", "m1")], vec![]);
         assert_eq!(plan.uploads.len(), 1);
     }
 }

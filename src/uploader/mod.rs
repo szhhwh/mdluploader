@@ -132,16 +132,13 @@ impl Uploader {
             self.concurrency
         );
 
-        let jobs = files
-            .iter()
-            .map(|file| {
-                let uploader = self.clone();
-                let file = file.clone();
-                (file.cloud_path.clone(), async move {
-                    uploader.upload_one(&file).await
-                })
-            })
-            .collect();
+        // The files are already owned; move each one into its job and keep a
+        // single clone of the name for error reporting.
+        let jobs = files.into_iter().map(|file| {
+            let uploader = self.clone();
+            let name = file.cloud_path.clone();
+            (name, async move { uploader.upload_one(&file).await })
+        });
 
         let failures = Self::run_limited(jobs, self.concurrency).await;
         Self::report_failures("upload", failures)
@@ -233,17 +230,11 @@ impl Uploader {
             self.concurrency
         );
 
-        let jobs = paths
-            .iter()
-            .map(|path| {
-                let uploader = self.clone();
-                let path = path.clone();
-                (
-                    path.clone(),
-                    async move { uploader.delete_one(&path).await },
-                )
-            })
-            .collect();
+        let jobs = paths.into_iter().map(|path| {
+            let uploader = self.clone();
+            let name = path.clone();
+            (name, async move { uploader.delete_one(&path).await })
+        });
 
         let failures = Self::run_limited(jobs, self.concurrency).await;
         Self::report_failures("delete", failures)
@@ -275,18 +266,16 @@ impl Uploader {
     ///
     /// # Arguments
     ///
-    /// * `jobs` - A vector of `(name, future)` pairs; the name identifies the
-    ///   job in error reports.
+    /// * `jobs` - An iterator of `(name, future)` pairs; the name identifies
+    ///   the job in error reports.
     /// * `limit` - Maximum number of jobs polled concurrently.
     ///
     /// # Returns
     ///
     /// A vector of `(name, error)` pairs for every job that failed.
-    async fn run_limited<Fut>(
-        jobs: Vec<(String, Fut)>,
-        limit: usize,
-    ) -> Vec<(String, anyhow::Error)>
+    async fn run_limited<I, Fut>(jobs: I, limit: usize) -> Vec<(String, anyhow::Error)>
     where
+        I: IntoIterator<Item = (String, Fut)>,
         Fut: Future<Output = Result<()>>,
     {
         futures::stream::iter(jobs)
