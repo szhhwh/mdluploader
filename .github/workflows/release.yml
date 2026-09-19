@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build binary
+        run: cargo build --verbose --release
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Package binary
+        run: |
+          mkdir -p release
+          cp target/release/mdluploader release/
+          tar -czvf mdluploader-linux-amd64.tar.gz -C release mdluploader
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mdluploader-linux-amd64.tar.gz

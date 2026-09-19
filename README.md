@@ -15,7 +15,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://gitea.lionhao.top/szhhwh/mdluploader.git
+git clone https://github.com/szhhwh/mdluploader.git
 cd mdluploader
 
 # 构建项目
@@ -34,7 +34,7 @@ mdluploader upload /path/to/markdown/folder \
   --sk SECRET_KEY \
   --region us-west-1 \
   --endpoint https://s3.us-west-1.amazonaws.com \
-  --remote-root remote_dir
+  --remote-root remote_dir \
   --domain https://www.example.com \
   --depth 5
 ```
@@ -47,14 +47,14 @@ mdluploader upload /path/to/markdown/folder \
 
 参数:
 - `path`: 包含要扫描的Markdown文件的目录（必需）
-- `--bucket`: S3 存储桶名称（必需）
-- `--ak`: S3访问密钥（必需）
-- `--sk`: S3密钥（必需）
-- `--region`: S3区域（必需）
-- `--endpoint`: S3端点URL（必需）
-- `--remote-root`: S3远端目录（必须）
-- `--domain, -d`: S3自定义访问域名（必须）
-- `--depth, -d`: 扫描的最大目录深度（默认值：10）
+- `-b, --bucket`: S3 存储桶名称（必需）
+- `-a, --ak`: S3访问密钥（必需）
+- `-s, --sk`: S3密钥（必需）
+- `-g, --region`: S3区域（必需）
+- `-e, --endpoint`: S3端点URL（必需）
+- `-r, --remote-root`: S3远端目录（可选）
+- `-d, --domain`: S3自定义访问域名（必需）
+- `--depth`: 扫描的最大目录深度（默认值：10）
 
 ## 工作原理
 

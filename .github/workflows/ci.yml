@@ -1,9 +1,10 @@
-name: dev
-run-name: Beta build — ${{ gitea.run_id }}
+name: CI
+
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
   pull_request:
-    types: [opened,synchronize]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -24,3 +25,6 @@ jobs:
         run: cargo build --verbose --release
         env:
           RUST_BACKTRACE: 1
+
+      - name: Run tests
+        run: cargo test
