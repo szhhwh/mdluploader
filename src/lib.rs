@@ -1,4 +1,7 @@
 pub mod cli;
+pub mod differ;
+pub mod mdparser;
+pub mod uploader;
 
 use anyhow::{Ok, Result};
 use log::debug;

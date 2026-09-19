@@ -29,10 +29,10 @@ pub fn link_replacer(content: &str, path_map: &std::collections::HashMap<String,
     let mut code_fence_count = 0;
 
     let chars: Vec<char> = content.chars().collect();
-    
+
     while current_pos < chars.len() {
         let ch = chars[current_pos];
-        
+
         // Process code blocks
         if ch == '`' {
             code_fence_count += 1;
@@ -106,11 +106,12 @@ pub fn link_replacer(content: &str, path_map: &std::collections::HashMap<String,
             State::CollectingUrl => {
                 if ch == ')' {
                     // URL collection complete, check if replacement is needed
-                    let local_path = PathBuf::from(&current_url).file_name()
+                    let local_path = PathBuf::from(&current_url)
+                        .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string();
-                    
+
                     // Try to parse absolute path
                     if let Some(s3_url) = path_map.get(&local_path) {
                         // Replace with S3 URL
@@ -118,10 +119,13 @@ pub fn link_replacer(content: &str, path_map: &std::collections::HashMap<String,
                         result.push_str(s3_url.as_str());
                     } else {
                         // If no match is found, keep the original URL
-                        trace!("No replacement found, keeping original link: {}", current_url);
+                        trace!(
+                            "No replacement found, keeping original link: {}",
+                            current_url
+                        );
                         result.push_str(&current_url);
                     }
-                    
+
                     result.push(ch); // Add closing parenthesis
                     current_url.clear();
                     alt_text.clear();
@@ -133,13 +137,13 @@ pub fn link_replacer(content: &str, path_map: &std::collections::HashMap<String,
             }
         }
     }
-    
+
     // Handle the state at the end
     if state == State::CollectingUrl && !current_url.is_empty() {
         // If we're collecting a URL at the end, add the collected part
         result.push_str(&current_url);
     }
-    
+
     result
 }
 
@@ -215,12 +219,12 @@ pub fn extract_img_urls(content: &str) -> Option<Vec<PathBuf>> {
             }
         }
     }
-    
+
     // Handle potential incomplete syntax - if we're not in Normal state at the end and URL was collected
     if state == State::CollectingUrl && !current_url.is_empty() {
         current_url.clear();
     }
-    
+
     if urls.is_empty() {
         None
     } else {

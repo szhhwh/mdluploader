@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
+use crate::FileInfo;
 use anyhow::{Ok, Result};
 use log::{info, trace};
-use mdluploader::FileInfo;
 
 /// Compares the differences between local and remote files.
 ///
@@ -30,11 +30,11 @@ use mdluploader::FileInfo;
 ///
 /// ```
 /// use mdluploader::FileInfo;
+/// use mdluploader::differ::diff::diff;
 /// use std::path::PathBuf;
-/// use mdluploader::differ::diff;
 ///
-/// let local_files = vec![FileInfo::new(PathBuf::from("file1.txt"), "md5hash1")];
-/// let remote_files = vec![FileInfo::new(PathBuf::from("file2.txt"), "md5hash2")];
+/// let local_files = vec![FileInfo::new(PathBuf::from("file1.txt"), "md5hash1".to_string())];
+/// let remote_files = vec![FileInfo::new(PathBuf::from("file2.txt"), "md5hash2".to_string())];
 ///
 /// let (uploadlist, deletelist, replacelist) = diff(local_files, remote_files).unwrap();
 /// assert_eq!(uploadlist.len(), 1);
@@ -81,18 +81,27 @@ pub fn diff(
 
         match local_name.cmp(remote_name) {
             std::cmp::Ordering::Less => {
-                info!("File {:?} does not exist in the cloud, waiting for upload", local_name);
+                info!(
+                    "File {:?} does not exist in the cloud, waiting for upload",
+                    local_name
+                );
                 uploadlist.push(local_file_info.get_path().to_path_buf());
                 local_idx += 1; // Only increase local index
             }
             std::cmp::Ordering::Greater => {
-                info!("File {:?} does not exist locally, waiting for deletion", remote_name);
+                info!(
+                    "File {:?} does not exist locally, waiting for deletion",
+                    remote_name
+                );
                 deletelist.push(remote_file_info.get_path().to_path_buf());
                 remote_idx += 1; // Only increase remote index
             }
             std::cmp::Ordering::Equal => {
                 if local_md5 != remote_md5 {
-                    info!("File {:?} content has changed, waiting for update", local_name);
+                    info!(
+                        "File {:?} content has changed, waiting for update",
+                        local_name
+                    );
                     replacelist.push(local_file_info.get_path().to_path_buf());
                 }
                 local_idx += 1; // Increase both indices
@@ -105,7 +114,10 @@ pub fn diff(
     while local_idx < local_sorted.len() {
         let local_file_info = &local_sorted[local_idx];
         let local_name = local_file_info.get_path().file_name().unwrap();
-        info!("File {:?} does not exist in the cloud, waiting for upload", local_name);
+        info!(
+            "File {:?} does not exist in the cloud, waiting for upload",
+            local_name
+        );
         uploadlist.push(local_file_info.get_path().to_path_buf());
         local_idx += 1;
     }
@@ -114,7 +126,10 @@ pub fn diff(
     while remote_idx < remote_sorted.len() {
         let remote_file_info = &remote_sorted[remote_idx];
         let remote_name = remote_file_info.get_path().file_name().unwrap();
-        info!("File {:?} does not exist locally, waiting for deletion", remote_name);
+        info!(
+            "File {:?} does not exist locally, waiting for deletion",
+            remote_name
+        );
         deletelist.push(remote_file_info.get_path().to_path_buf());
         remote_idx += 1;
     }

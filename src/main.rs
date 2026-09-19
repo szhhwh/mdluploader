@@ -11,11 +11,6 @@ use std::str::FromStr;
 use uploader::{s3::AwsS3, uploader::UpFile, uploader::Uploader};
 use url::Url;
 
-// Modules
-mod differ;
-mod mdparser;
-mod uploader;
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
