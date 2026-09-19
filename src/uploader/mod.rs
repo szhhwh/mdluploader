@@ -6,6 +6,16 @@ use opendal::Operator;
 use std::future::Future;
 use std::path::PathBuf;
 use tokio::fs;
+use tokio::io::AsyncReadExt;
+
+/// Chunk size used when streaming uploads: bytes read from disk and pushed to
+/// the cloud writer per iteration.
+///
+/// 1 MiB bounds peak memory per concurrent transfer to roughly a megabyte
+/// while amortizing the per-request overhead far better than the 64 KiB
+/// buffer used for local MD5 hashing (each chunk becomes a network write,
+/// not just a hash update).
+const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Represents a file to be uploaded to the cloud storage.
 #[derive(Debug, Clone)]
@@ -125,6 +135,11 @@ impl Uploader {
 
     /// Uploads a single file to the cloud storage.
     ///
+    /// The file is streamed in fixed-size chunks instead of being buffered
+    /// whole, so peak memory stays bounded by the chunk size no matter how
+    /// large the file is (or how many transfers run concurrently). Empty
+    /// files skip the loop entirely and commit an empty object on close.
+    ///
     /// # Arguments
     ///
     /// * `file` - The `UpFile` describing the local source and cloud destination.
@@ -133,19 +148,40 @@ impl Uploader {
     ///
     /// A `Result` indicating success or failure.
     async fn upload_one(&self, file: &UpFile) -> Result<()> {
-        let bytes = fs::read(&file.local_path)
-            .await
-            .with_context(|| format!("Failed to read local file {}", file.local_path.display()))?;
-
         debug!(
-            "Uploading {} ({} bytes) to cloud path {}",
+            "Uploading {} to cloud path {}",
             file.local_path.display(),
-            bytes.len(),
             file.cloud_path
         );
 
-        self.op
-            .write(&file.cloud_path, bytes)
+        let mut reader = fs::File::open(&file.local_path)
+            .await
+            .with_context(|| format!("Failed to read local file {}", file.local_path.display()))?;
+        let mut writer = self
+            .op
+            .writer(&file.cloud_path)
+            .await
+            .with_context(|| format!("Failed to write cloud path {}", file.cloud_path))?;
+
+        // `read_buf` pulls straight into the chunk's spare capacity and the
+        // chunk is moved into the writer, so each megabyte is neither zeroed
+        // nor copied on its way to storage.
+        loop {
+            let mut chunk = Vec::with_capacity(UPLOAD_CHUNK_SIZE);
+            let n = reader.read_buf(&mut chunk).await.with_context(|| {
+                format!("Failed to read local file {}", file.local_path.display())
+            })?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write(chunk)
+                .await
+                .with_context(|| format!("Failed to write cloud path {}", file.cloud_path))?;
+        }
+
+        let _meta = writer
+            .close()
             .await
             .with_context(|| format!("Failed to write cloud path {}", file.cloud_path))?;
         Ok(())
@@ -284,6 +320,56 @@ mod tests {
 
         let got = op.read("pic.png").await.unwrap().to_vec();
         assert_eq!(got, b"png-bytes-123");
+    }
+
+    #[tokio::test]
+    async fn upload_files_streams_multi_chunk_file() {
+        // A file larger than one upload chunk must survive the streaming
+        // loop byte for byte. 3 MiB of pseudo-random data means three full
+        // 1 MiB writes plus a final zero-byte read that ends the loop.
+        let mut rng: u32 = 0x1234_5678;
+        let data: Vec<u8> = (0..3 * UPLOAD_CHUNK_SIZE)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                (rng >> 24) as u8
+            })
+            .collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("big.bin");
+        std::fs::write(&img, &data).unwrap();
+
+        let op = memory_op();
+        let uploader = Uploader::new(op.clone());
+        uploader
+            .upload_files(vec![UpFile::new(img, "big.bin".to_string())])
+            .await
+            .unwrap();
+
+        let got = op.read("big.bin").await.unwrap();
+        assert_eq!(got.len(), data.len());
+        assert_eq!(got.to_vec(), data);
+    }
+
+    #[tokio::test]
+    async fn upload_files_handles_empty_file() {
+        // Zero-byte files must commit an empty object instead of failing or
+        // silently skipping the write.
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("empty.png");
+        std::fs::write(&img, b"").unwrap();
+
+        let op = memory_op();
+        let uploader = Uploader::new(op.clone());
+        uploader
+            .upload_files(vec![UpFile::new(img, "empty.png".to_string())])
+            .await
+            .unwrap();
+
+        let meta = op.stat("empty.png").await.unwrap();
+        assert_eq!(meta.content_length(), 0);
     }
 
     #[tokio::test]
