@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use log::{debug, info, warn};
 use opendal::Operator;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -193,7 +193,21 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
         }
     }
 
-    rewrite_markdown_links(&scan.images_by_md, &path_map);
+    let failures = rewrite_markdown_links(&scan.images_by_md, &path_map);
+    if !failures.is_empty() {
+        // Images are already on the remote at this point; exiting non-zero is
+        // the only way to tell the caller the markdown still points at local
+        // files (CI must not mistake this for a successful run).
+        let details: Vec<String> = failures
+            .iter()
+            .map(|f| format!("{} ({})", f.path.display(), f.reason))
+            .collect();
+        bail!(
+            "Failed to rewrite image links in {} markdown file(s): {}",
+            failures.len(),
+            details.join("; ")
+        );
+    }
     info!("Pipeline finished.");
     Ok(())
 }
@@ -359,42 +373,93 @@ pub fn final_remote_set(
         .collect()
 }
 
+/// One markdown file whose image links could not be rewritten.
+#[derive(Debug)]
+struct RewriteFailure {
+    /// The markdown file that could not be processed.
+    path: PathBuf,
+    /// Why reading or writing the file failed.
+    reason: String,
+}
+
 /// Rewrites image links in every markdown file that references at least one
 /// uploaded image.
+///
+/// Returns the files whose content could not be read or written back; an
+/// empty list means every affected file was processed successfully.
 fn rewrite_markdown_links(
     images_by_md: &HashMap<PathBuf, Vec<PathBuf>>,
     path_map: &HashMap<PathBuf, String>,
-) {
+) -> Vec<RewriteFailure> {
     if path_map.is_empty() {
         info!("No uploaded images; skipping link replacement.");
-        return;
+        return Vec::new();
     }
     info!("Replacing image links in markdown files...");
 
+    let mut failures = Vec::new();
     for (md_file, images) in images_by_md {
         if !images.iter().any(|img| path_map.contains_key(img)) {
             continue;
         }
 
-        let Ok(content) = std::fs::read_to_string(md_file) else {
-            warn!("Failed to read {} for link replacement", md_file.display());
-            continue;
-        };
-
-        let new_content = replace_image_links(&content, |dest| {
-            let abs = resolve_image_path(&percent_decode(dest), md_file)?;
-            path_map.get(&abs).cloned()
-        });
-
-        if new_content != content {
-            match std::fs::write(md_file, &new_content) {
-                Ok(()) => info!("Updated links in {}", md_file.display()),
-                Err(e) => warn!("Failed to write back {}: {}", md_file.display(), e),
+        let result = rewrite_one_file(
+            md_file,
+            path_map,
+            || std::fs::read_to_string(md_file),
+            |new_content| std::fs::write(md_file, new_content),
+        );
+        match result {
+            Ok(true) => info!("Updated links in {}", md_file.display()),
+            Ok(false) => {}
+            Err(failure) => {
+                warn!(
+                    "Failed to rewrite links in {}: {}",
+                    failure.path.display(),
+                    failure.reason
+                );
+                failures.push(failure);
             }
         }
     }
 
-    info!("Completed markdown image link replacement.");
+    if failures.is_empty() {
+        info!("Completed markdown image link replacement.");
+    }
+    failures
+}
+
+/// Reads one markdown file, replaces its image links and writes it back.
+///
+/// The read and write operations are injected so failure paths can be unit
+/// tested without relying on real filesystem permissions. Returns `Ok(true)`
+/// when the file was rewritten, `Ok(false)` when no link changed, and an
+/// [`RewriteFailure`] when reading or writing failed.
+fn rewrite_one_file(
+    md_file: &Path,
+    path_map: &HashMap<PathBuf, String>,
+    read: impl FnOnce() -> std::io::Result<String>,
+    write: impl FnOnce(&str) -> std::io::Result<()>,
+) -> Result<bool, RewriteFailure> {
+    let content = read().map_err(|e| RewriteFailure {
+        path: md_file.to_path_buf(),
+        reason: format!("failed to read: {e}"),
+    })?;
+
+    let new_content = replace_image_links(&content, |dest| {
+        let abs = resolve_image_path(&percent_decode(dest), md_file)?;
+        path_map.get(&abs).cloned()
+    });
+
+    if new_content == content {
+        return Ok(false);
+    }
+
+    write(&new_content).map_err(|e| RewriteFailure {
+        path: md_file.to_path_buf(),
+        reason: format!("failed to write back: {e}"),
+    })?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -543,6 +608,104 @@ mod tests {
         assert!(!set.contains("a.png"));
         assert!(set.contains("b.png"));
         assert!(set.contains("c.png"));
+    }
+
+    /// Builds a temp dir with `post.md` referencing a local image, plus the
+    /// corresponding `path_map` entry, for `rewrite_one_file` tests.
+    fn rewrite_fixture() -> (tempfile::TempDir, PathBuf, HashMap<PathBuf, String>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("images")).unwrap();
+        std::fs::write(dir.path().join("images/a.png"), b"x").unwrap();
+        let md = dir.path().join("post.md");
+        std::fs::write(&md, "![a](images/a.png)\n").unwrap();
+
+        let img = dir.path().join("images/a.png").canonicalize().unwrap();
+        let mut path_map = HashMap::new();
+        path_map.insert(img, "https://cdn.example.com/images/a.png".to_string());
+        (dir, md, path_map)
+    }
+
+    #[test]
+    fn rewrite_one_file_reports_read_failure() {
+        let (_dir, md, path_map) = rewrite_fixture();
+
+        let failure = rewrite_one_file(
+            &md,
+            &path_map,
+            || Err(std::io::Error::other("permission denied")),
+            |_| unreachable!("write must not run when read fails"),
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.path, md);
+        assert!(
+            failure.reason.contains("read"),
+            "unexpected reason: {}",
+            failure.reason
+        );
+        assert!(
+            failure.reason.contains("permission denied"),
+            "unexpected reason: {}",
+            failure.reason
+        );
+    }
+
+    #[test]
+    fn rewrite_one_file_reports_write_failure() {
+        let (_dir, md, path_map) = rewrite_fixture();
+
+        let failure = rewrite_one_file(
+            &md,
+            &path_map,
+            || std::fs::read_to_string(&md),
+            |_| Err(std::io::Error::other("read-only filesystem")),
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.path, md);
+        assert!(
+            failure.reason.contains("write"),
+            "unexpected reason: {}",
+            failure.reason
+        );
+        assert!(
+            failure.reason.contains("read-only filesystem"),
+            "unexpected reason: {}",
+            failure.reason
+        );
+    }
+
+    #[test]
+    fn rewrite_one_file_writes_back_only_when_links_change() {
+        let (_dir, md, path_map) = rewrite_fixture();
+
+        // Matching link: the rewritten content is handed to the writer.
+        let mut written: Option<String> = None;
+        let changed = rewrite_one_file(
+            &md,
+            &path_map,
+            || std::fs::read_to_string(&md),
+            |content| {
+                written = Some(content.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(
+            written.as_deref(),
+            Some("![a](https://cdn.example.com/images/a.png)\n")
+        );
+
+        // Nothing to replace: the writer must not run at all.
+        let changed = rewrite_one_file(
+            &md,
+            &path_map,
+            || Ok("No images here.\n".to_string()),
+            |_| unreachable!("write must not run when nothing changed"),
+        )
+        .unwrap();
+        assert!(!changed);
     }
 }
 
@@ -790,6 +953,50 @@ mod pipeline_e2e_tests {
             b.contains("https://cdn.example.com/p2/images/logo.png"),
             "{}",
             b
+        );
+    }
+
+    #[tokio::test]
+    async fn run_fails_when_markdown_write_back_fails() {
+        // Regression: when the images are already on the remote but the
+        // markdown write-back fails (here: read-only file, non-root), the run
+        // must return an error naming the file instead of exiting zero with
+        // the markdown still pointing at local paths.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("images")).unwrap();
+        std::fs::write(dir.path().join("images/a.png"), b"png-bytes").unwrap();
+        let md = dir.path().join("post.md");
+        std::fs::write(&md, "![a](images/a.png)\n").unwrap();
+
+        let op = memory_op();
+        // First run uploads the image and rewrites the link while the file
+        // is still writable.
+        run_once(&op, dir.path()).await.unwrap();
+        assert!(op.stat("images/a.png").await.is_ok());
+
+        // Re-introduce the local link, then make the file read-only so the
+        // write-back of the second run fails deterministically.
+        std::fs::write(&md, "![a](images/a.png)\n").unwrap();
+        let original_perms = std::fs::metadata(&md).unwrap().permissions();
+        let mut perms = original_perms.clone();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&md, perms).unwrap();
+
+        let result = run_once(&op, dir.path()).await;
+
+        // Restore the original permissions so the tempdir cleanup succeeds.
+        std::fs::set_permissions(&md, original_perms).unwrap();
+
+        let err = result.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("post.md"), "error must name the file: {msg}");
+        assert!(msg.contains("rewrite"), "error must say what failed: {msg}");
+
+        // The uploaded object survives; only the markdown was left untouched.
+        assert!(op.stat("images/a.png").await.is_ok());
+        assert_eq!(
+            std::fs::read_to_string(&md).unwrap(),
+            "![a](images/a.png)\n"
         );
     }
 }
