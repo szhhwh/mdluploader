@@ -101,7 +101,7 @@ mdluploader completions bash
 
 ## 依赖项
 
-- Rust 1.68+
+- Rust 1.80+（跟随 OpenDAL 0.53 的 `rust-version` 要求）
 - OpenDAL 用于云存储操作
 - Tokio 用于异步运行时
 - Rayon 用于并行化处理

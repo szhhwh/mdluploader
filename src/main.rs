@@ -7,11 +7,8 @@ use mdluploader::uploader::s3::AwsS3;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-    env_logger::init();
+    // Initialize logging; default to "info" when RUST_LOG is not set.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = cli::Args::parse();
 
