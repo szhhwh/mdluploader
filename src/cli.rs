@@ -59,6 +59,11 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
 
+        /// Cache-Control header set on uploaded objects
+        /// (empty string leaves the header unset)
+        #[arg(long, default_value = "public, max-age=86400")]
+        cache_control: String,
+
         /// Maximum number of concurrent cloud transfers
         /// (default: CPU-based heuristic, clamped to 4..=32)
         #[arg(long)]
@@ -105,6 +110,8 @@ mod tests {
             "imgs",
             "--depth",
             "3",
+            "--cache-control",
+            "public, max-age=3600",
         ]);
 
         let Commands::Upload {
@@ -118,6 +125,7 @@ mod tests {
             domain,
             remote_root,
             dry_run,
+            cache_control,
             concurrency,
         } = args.command
         else {
@@ -134,7 +142,59 @@ mod tests {
         assert_eq!(domain, "https://cdn.example.com");
         assert_eq!(remote_root.as_deref(), Some("imgs"));
         assert!(!dry_run);
+        assert_eq!(cache_control, "public, max-age=3600");
         assert_eq!(concurrency, None);
+    }
+
+    #[test]
+    fn cache_control_defaults_overrides_and_empties() {
+        let base = [
+            "mdluploader",
+            "upload",
+            "/md",
+            "-b",
+            "b",
+            "-a",
+            "a",
+            "-s",
+            "s",
+            "-g",
+            "r",
+            "-e",
+            "https://e",
+            "-d",
+            "https://d",
+        ];
+
+        // Default keeps the moderate one-day policy (images are replaced
+        // in place by cloud path, so the default must not be immutable).
+        let args = Args::parse_from(base.to_vec());
+        let Commands::Upload { cache_control, .. } = args.command else {
+            panic!("expected upload command");
+        };
+        assert_eq!(cache_control, "public, max-age=86400");
+
+        // Explicit override wins.
+        let args = Args::parse_from({
+            let mut v = base.to_vec();
+            v.extend(["--cache-control", "public, max-age=604800"]);
+            v
+        });
+        let Commands::Upload { cache_control, .. } = args.command else {
+            panic!("expected upload command");
+        };
+        assert_eq!(cache_control, "public, max-age=604800");
+
+        // An empty string is accepted and means "leave the header unset".
+        let args = Args::parse_from({
+            let mut v = base.to_vec();
+            v.extend(["--cache-control", ""]);
+            v
+        });
+        let Commands::Upload { cache_control, .. } = args.command else {
+            panic!("expected upload command");
+        };
+        assert_eq!(cache_control, "");
     }
 
     #[test]

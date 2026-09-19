@@ -49,6 +49,42 @@ pub fn get_file_md5<P: AsRef<Path>>(path: P) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Guesses the Content-Type of a file from its extension.
+///
+/// Covers the image formats an image bed typically serves plus a few
+/// non-image formats found next to them in markdown trees. Extensions
+/// are matched case-insensitively; unknown or missing extensions fall
+/// back to `application/octet-stream`, matching what S3 stores when no
+/// Content-Type is sent along with the upload.
+///
+/// # Arguments
+/// - `path` - Path of the file to inspect.
+///
+/// # Return
+/// - The MIME type as a static string.
+pub fn guess_content_type<P: AsRef<Path>>(path: P) -> &'static str {
+    let ext = path
+        .as_ref()
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "json" => "application/json",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Maps a local image path to its cloud path.
 ///
 /// Images inside the markdown source tree keep their relative structure
@@ -172,6 +208,56 @@ mod tests {
         // A file can never equal the source root, but the degenerate case
         // should not panic and should normalize to the empty cloud path.
         assert_eq!(to_cloud_path(Path::new("/blog"), Path::new("/blog")), "");
+    }
+
+    #[test]
+    fn guess_content_type_maps_common_image_formats() {
+        assert_eq!(guess_content_type(Path::new("a.png")), "image/png");
+        assert_eq!(guess_content_type(Path::new("a.jpg")), "image/jpeg");
+        assert_eq!(guess_content_type(Path::new("a.jpeg")), "image/jpeg");
+        assert_eq!(guess_content_type(Path::new("a.gif")), "image/gif");
+        assert_eq!(guess_content_type(Path::new("a.webp")), "image/webp");
+        assert_eq!(guess_content_type(Path::new("a.svg")), "image/svg+xml");
+        assert_eq!(guess_content_type(Path::new("a.avif")), "image/avif");
+        assert_eq!(guess_content_type(Path::new("a.bmp")), "image/bmp");
+        assert_eq!(guess_content_type(Path::new("a.ico")), "image/x-icon");
+    }
+
+    #[test]
+    fn guess_content_type_maps_a_few_non_image_formats() {
+        assert_eq!(guess_content_type(Path::new("doc.pdf")), "application/pdf");
+        assert_eq!(guess_content_type(Path::new("notes.txt")), "text/plain");
+        assert_eq!(
+            guess_content_type(Path::new("data.json")),
+            "application/json"
+        );
+        assert_eq!(guess_content_type(Path::new("clip.mp4")), "video/mp4");
+    }
+
+    #[test]
+    fn guess_content_type_is_case_insensitive() {
+        assert_eq!(guess_content_type(Path::new("PIC.PNG")), "image/png");
+        assert_eq!(guess_content_type(Path::new("pic.Jpg")), "image/jpeg");
+        assert_eq!(guess_content_type(Path::new("sub/pic.WebP")), "image/webp");
+    }
+
+    #[test]
+    fn guess_content_type_falls_back_to_octet_stream() {
+        // Unknown extension.
+        assert_eq!(
+            guess_content_type(Path::new("archive.xyz")),
+            "application/octet-stream"
+        );
+        // No extension at all.
+        assert_eq!(
+            guess_content_type(Path::new("README")),
+            "application/octet-stream"
+        );
+        // Only the last extension segment counts.
+        assert_eq!(
+            guess_content_type(Path::new("photo.png.exe")),
+            "application/octet-stream"
+        );
     }
 
     #[test]
