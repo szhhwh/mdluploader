@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ops::Range;
 
 use log::trace;
@@ -5,8 +6,11 @@ use percent_encoding::percent_decode_str;
 use pulldown_cmark::{Event, LinkType, Options, Parser, Tag};
 
 /// Percent-decodes a markdown link destination (e.g. `my%20image.png`).
-pub fn percent_decode(dest: &str) -> String {
-    percent_decode_str(dest).decode_utf8_lossy().to_string()
+///
+/// Returns a [`Cow`]: destinations without percent-encoded sequences (the
+/// common case) borrow the input, so no heap allocation happens.
+pub fn percent_decode<'a>(dest: &'a str) -> Cow<'a, str> {
+    percent_decode_str(dest).decode_utf8_lossy()
 }
 
 /// Returns true when a link destination points at a remote resource instead
@@ -290,6 +294,15 @@ mod link_extractor_test {
     fn test_percent_decode_helper() {
         assert_eq!(percent_decode("my%20image.png"), "my image.png");
         assert_eq!(percent_decode("plain.png"), "plain.png");
+
+        // Destinations without percent-encoded sequences borrow the input
+        // instead of allocating.
+        assert!(matches!(
+            percent_decode("plain.png"),
+            Cow::Borrowed("plain.png")
+        ));
+        // Encoded destinations decode into an owned string.
+        assert!(matches!(percent_decode("my%20image.png"), Cow::Owned(_)));
     }
 }
 
