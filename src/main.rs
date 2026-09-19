@@ -168,9 +168,9 @@ async fn upload(
         .map(|file| UpFile::from_pathbuf(file, &md_src_path).unwrap())
         .collect();
 
-    let deletelist: Vec<UpFile> = deletelist
+    let deletelist: Vec<String> = deletelist
         .par_iter()
-        .map(|file| UpFile::from_pathbuf(file, &md_src_path).unwrap())
+        .map(|file| UpFile::from_pathbuf(file, &md_src_path).unwrap().cloud_path)
         .collect();
 
     let replacelist: Vec<UpFile> = replacelist
