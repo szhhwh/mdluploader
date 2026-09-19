@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use log::info;
 use mdluploader::cli;
 use mdluploader::pipeline::{self, PipelineConfig};
@@ -47,6 +47,14 @@ async fn main() -> Result<()> {
                 concurrency,
             };
             pipeline::run(op, config).await?;
+        }
+        cli::Commands::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut cli::Args::command(),
+                "mdluploader",
+                &mut std::io::stdout(),
+            );
         }
     }
 

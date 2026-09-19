@@ -74,6 +74,20 @@ mdluploader upload /path/to/markdown/folder \
   --dry-run
 ```
 
+#### `completions`
+
+为指定的 shell 生成命令行补全脚本。
+
+参数:
+- `shell`: 目标 shell（支持 `bash`、`zsh`、`fish`、`powershell`、`elvish`，必需）
+
+示例：
+
+```bash
+# 生成 bash 补全脚本（输出可重定向后由 shell 加载）
+mdluploader completions bash
+```
+
 ## 工作原理
 
 1. 递归扫描提供的目录中的Markdown文件
