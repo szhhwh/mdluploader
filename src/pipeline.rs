@@ -255,7 +255,15 @@ fn scan_markdown_file(
 /// manages. Returns `None` for foreign URLs and non-URLs.
 fn managed_cloud_path(dest: &str, domain: &Url, remote_root: &str) -> Option<String> {
     let url = Url::parse(dest).ok()?;
-    if url.domain() != domain.domain() {
+    // Match host and port strictly. Comparing `domain()` alone would accept
+    // URLs served on a different port, and `domain()` is `None` for IP hosts,
+    // so any two IPs would compare equal. `port_or_known_default()` treats an
+    // explicit default port (e.g. `:443` for https) the same as no port.
+    match (url.host_str(), domain.host_str()) {
+        (Some(url_host), Some(domain_host)) if url_host == domain_host => {}
+        _ => return None,
+    }
+    if url.port_or_known_default() != domain.port_or_known_default() {
         return None;
     }
     let root = remote_root.trim_matches('/');
@@ -483,6 +491,45 @@ mod tests {
         assert_eq!(
             managed_cloud_path("https://cdn.example.com/imgsx/a.png", &domain, "imgs"),
             None
+        );
+    }
+
+    #[test]
+    fn managed_cloud_path_matches_host_and_port_strictly() {
+        let domain = Url::parse("https://cdn.example.com").unwrap();
+
+        // The same host on a non-default port is a different origin.
+        assert_eq!(
+            managed_cloud_path("https://cdn.example.com:8443/imgs/a.png", &domain, "imgs"),
+            None
+        );
+        // An explicit default port is the same URL as the omitted-port form.
+        assert_eq!(
+            managed_cloud_path("https://cdn.example.com:443/imgs/a.png", &domain, "imgs"),
+            Some("a.png".to_string())
+        );
+
+        // A configured non-default port only matches that exact port.
+        let ported = Url::parse("https://cdn.example.com:8443").unwrap();
+        assert_eq!(
+            managed_cloud_path("https://cdn.example.com/imgs/a.png", &ported, "imgs"),
+            None
+        );
+        assert_eq!(
+            managed_cloud_path("https://cdn.example.com:8443/imgs/a.png", &ported, "imgs"),
+            Some("a.png".to_string())
+        );
+
+        // IP hosts: `domain()` is `None` for both, so they must be told
+        // apart by comparing the host strings directly.
+        let ip_domain = Url::parse("https://1.2.3.4").unwrap();
+        assert_eq!(
+            managed_cloud_path("https://5.6.7.8/imgs/a.png", &ip_domain, "imgs"),
+            None
+        );
+        assert_eq!(
+            managed_cloud_path("https://1.2.3.4/imgs/a.png", &ip_domain, "imgs"),
+            Some("a.png".to_string())
         );
     }
 
