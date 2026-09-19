@@ -205,7 +205,7 @@ pub async fn run(op: Operator, config: PipelineConfig) -> Result<()> {
         // files (CI must not mistake this for a successful run).
         let details: Vec<String> = failures
             .iter()
-            .map(|f| format!("{} ({})", f.path.display(), f.reason))
+            .map(|f| format!("{} ({})", f.path.display(), f.error))
             .collect();
         bail!(
             "Failed to rewrite image links in {} markdown file(s): {}",
@@ -403,13 +403,31 @@ pub fn final_remote_set(
         .collect()
 }
 
+/// Why rewriting a markdown file failed.
+#[derive(Debug)]
+enum RewriteError {
+    /// Reading the markdown file failed.
+    Read(std::io::Error),
+    /// Writing the rewritten content back failed.
+    Write(std::io::Error),
+}
+
+impl std::fmt::Display for RewriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RewriteError::Read(e) => write!(f, "failed to read: {e}"),
+            RewriteError::Write(e) => write!(f, "failed to write back: {e}"),
+        }
+    }
+}
+
 /// One markdown file whose image links could not be rewritten.
 #[derive(Debug)]
 struct RewriteFailure {
     /// The markdown file that could not be processed.
     path: PathBuf,
     /// Why reading or writing the file failed.
-    reason: String,
+    error: RewriteError,
 }
 
 /// Rewrites image links in every markdown file that references at least one
@@ -446,7 +464,7 @@ fn rewrite_markdown_links(
                 warn!(
                     "Failed to rewrite links in {}: {}",
                     failure.path.display(),
-                    failure.reason
+                    failure.error
                 );
                 failures.push(failure);
             }
@@ -473,7 +491,7 @@ fn rewrite_one_file(
 ) -> Result<bool, RewriteFailure> {
     let content = read().map_err(|e| RewriteFailure {
         path: md_file.to_path_buf(),
-        reason: format!("failed to read: {e}"),
+        error: RewriteError::Read(e),
     })?;
 
     let new_content = replace_image_links(&content, |dest| {
@@ -487,7 +505,7 @@ fn rewrite_one_file(
 
     write(&new_content).map_err(|e| RewriteFailure {
         path: md_file.to_path_buf(),
-        reason: format!("failed to write back: {e}"),
+        error: RewriteError::Write(e),
     })?;
     Ok(true)
 }
@@ -716,15 +734,12 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(failure.path, md);
+        let RewriteError::Read(e) = &failure.error else {
+            panic!("expected a read failure, got: {:?}", failure.error);
+        };
         assert!(
-            failure.reason.contains("read"),
-            "unexpected reason: {}",
-            failure.reason
-        );
-        assert!(
-            failure.reason.contains("permission denied"),
-            "unexpected reason: {}",
-            failure.reason
+            e.to_string().contains("permission denied"),
+            "unexpected error: {e}"
         );
     }
 
@@ -741,15 +756,12 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(failure.path, md);
+        let RewriteError::Write(e) = &failure.error else {
+            panic!("expected a write failure, got: {:?}", failure.error);
+        };
         assert!(
-            failure.reason.contains("write"),
-            "unexpected reason: {}",
-            failure.reason
-        );
-        assert!(
-            failure.reason.contains("read-only filesystem"),
-            "unexpected reason: {}",
-            failure.reason
+            e.to_string().contains("read-only filesystem"),
+            "unexpected error: {e}"
         );
     }
 
